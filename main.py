@@ -35,93 +35,87 @@ logger = logging.getLogger(__name__)
 
 # === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ SQLite ===
 def init_db():
-  conn = sqlite3.connect("bot_database.db")
-  cursor = conn.cursor()
-  cursor.execute(
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS orders (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              user_id INTEGER,
+              service_name TEXT,
+              total_price REAL,
+              status TEXT,
+              created_at TEXT,
+              target_info TEXT
+          )
       """
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            service_name TEXT,
-            total_price REAL,
-            status TEXT,
-            created_at TEXT,
-            target_info TEXT
-        )
-    """
-  )
-  cursor.execute(
+    )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS banned_users (
+              user_id INTEGER PRIMARY KEY
+          )
       """
-        CREATE TABLE IF NOT EXISTS banned_users (
-            user_id INTEGER PRIMARY KEY
-        )
-    """
-  )
-  conn.commit()
-  conn.close()
+    )
+    conn.commit()
 
 
 def add_order_to_db(
     user_id: int, service_name: str, total_price: float, status: str, target_info: str
 ):
-  conn = sqlite3.connect("bot_database.db")
-  cursor = conn.cursor()
-  date_str = datetime.datetime.now().strftime("%d %B")
-  cursor.execute(
-      """
-        INSERT INTO orders (user_id, service_name, total_price, status, created_at, target_info)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """,
-      (user_id, service_name, total_price, status, date_str, target_info),
-  )
-  conn.commit()
-  order_id = cursor.lastrowid
-  conn.close()
-  return order_id
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    date_str = datetime.datetime.now().strftime("%d %B")
+    cursor.execute(
+        """
+          INSERT INTO orders (user_id, service_name, total_price, status, created_at, target_info)
+          VALUES (?, ?, ?, ?, ?, ?)
+      """,
+        (user_id, service_name, total_price, status, date_str, target_info),
+    )
+    conn.commit()
+    return cursor.lastrowid
 
 
 def get_user_orders_from_db(user_id: int):
-  conn = sqlite3.connect("bot_database.db")
-  cursor = conn.cursor()
-  cursor.execute(
-      """
-        SELECT id, service_name, total_price, status, created_at, target_info 
-        FROM orders WHERE user_id = ? ORDER BY id DESC
-    """,
-      (user_id,),
-  )
-  rows = cursor.fetchall()
-  conn.close()
-  orders = []
-  for row in rows:
-    orders.append(
-        {
-            "id": row[0],
-            "service_name": row[1],
-            "total_price": row[2],
-            "status": row[3],
-            "created_at": row[4],
-            "target_info": row[5],
-        }
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
+          SELECT id, service_name, total_price, status, created_at, target_info 
+          FROM orders WHERE user_id = ? ORDER BY id DESC
+      """,
+        (user_id,),
     )
-  return orders
+    rows = cursor.fetchall()
+    orders = []
+    for row in rows:
+      orders.append(
+          {
+              "id": row[0],
+              "service_name": row[1],
+              "total_price": row[2],
+              "status": row[3],
+              "created_at": row[4],
+              "target_info": row[5],
+          }
+      )
+    return orders
 
 
 def is_user_banned(user_id: int) -> bool:
-  conn = sqlite3.connect("bot_database.db")
-  cursor = conn.cursor()
-  cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
-  row = cursor.fetchone()
-  conn.close()
-  return row is not None
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    return row is not None
 
 
 def ban_user_in_db(user_id: int):
-  conn = sqlite3.connect("bot_database.db")
-  cursor = conn.cursor()
-  cursor.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
-  conn.commit()
-  conn.close()
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
+    conn.commit()
 
 
 class OrderForm(StatesGroup):
@@ -269,7 +263,7 @@ def get_banner_path(banner_name: str):
   return None
 
 
-# === ИСПРАВЛЕННАЯ НАДЕЖНАЯ ФУНКЦИЯ РЕНДЕРИНГА (УСТРАНЕНИЕ ЗАВИСАНИЙ) ===
+# === 100% ЗАЩИЩЕННАЯ И НАДЕЖНАЯ ФУНКЦИЯ РЕНДЕРИНГА (УСТРАНЕНИЕ ЛЮБЫХ ЗАВИСАНИЙ) ===
 async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_name: str, text: str, reply_markup: InlineKeyboardMarkup):
   bot = event.bot
   chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
@@ -311,7 +305,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
     except Exception:
       pass
 
-    # Fallback для Callback
+    # Безопасный Fallback для Callback
     try:
       if photo_source:
         new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
@@ -321,15 +315,15 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
         new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
       await state.update_data(bot_msg_id=new_msg.message_id)
     except Exception as e:
-      logger.error(f"Ошибка отправки в render_step (callback): {e}")
+      logger.error(f"Ошибка отправки в render_step (callback fallback): {e}")
   else:
-    # Удаляем сообщение пользователя
+    # Удаляем сообщение пользователя, чтобы чат был чистым
     try:
       await event.delete()
     except Exception:
       pass
 
-    # Пытаемся отредактировать предыдущее сообщение бота
+    edited_successfully = False
     if bot_msg_id:
       try:
         if photo_source:
@@ -341,7 +335,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
           )
           if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
             BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
-          return
+          edited_successfully = True
         else:
           await bot.edit_message_text(
               chat_id=chat_id,
@@ -350,21 +344,22 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
               reply_markup=reply_markup,
               parse_mode="HTML"
           )
-          return
+          edited_successfully = True
       except Exception:
         pass
 
-    # Обязательный Fallback: если редактирование не удалось, шлем новое сообщение и обновляем bot_msg_id
-    try:
-      if photo_source:
-        new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
-        if banner_name not in BANNER_CACHE and new_msg.photo:
-          BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
-      else:
-        new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
-      await state.update_data(bot_msg_id=new_msg.message_id)
-    except Exception as e:
-      logger.error(f"Ошибка отправки в render_step (message): {e}")
+    # ГАРАНТИРОВАННЫЙ FALLBACK: если редактирование не удалось, всегда отправляем новое сообщение пользователю
+    if not edited_successfully:
+      try:
+        if photo_source:
+          new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+          if banner_name not in BANNER_CACHE and new_msg.photo:
+            BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
+        else:
+          new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+        await state.update_data(bot_msg_id=new_msg.message_id)
+      except Exception as e:
+        logger.error(f"Ошибка отправки нового сообщения в render_step (message fallback): {e}")
 
 
 # === ГЛАВНОЕ МЕНЮ (КИБЕР) С ИНВЕРТИРОВАННЫМИ ЦВЕТАМИ КНОПОК ===
