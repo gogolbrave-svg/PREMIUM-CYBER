@@ -269,7 +269,7 @@ def get_banner_path(banner_name: str):
   return None
 
 
-# === УНИВЕРСАЛЬНАЯ ФУНКЦИЯ ЦЕЛЬНОГО ОБНОВЛЕНИЯ БАННЕРОВ (С КЕШИРОВАНИЕМ FILE_ID) ===
+# === ИСПРАВЛЕННАЯ НАДЕЖНАЯ ФУНКЦИЯ РЕНДЕРИНГА (УСТРАНЕНИЕ ЗАВИСАНИЙ) ===
 async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_name: str, text: str, reply_markup: InlineKeyboardMarkup):
   bot = event.bot
   chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
@@ -288,41 +288,48 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
   if isinstance(event, CallbackQuery):
     await event.answer()
     msg = event.message
-    if photo_source:
-      try:
-        sent_msg = await msg.edit_media(
-            media=InputMediaPhoto(media=photo_source, caption=text, parse_mode="HTML"),
-            reply_markup=reply_markup
-        )
-        if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
-          BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
-      except Exception:
+    try:
+      if photo_source:
         try:
-          await msg.delete()
+          sent_msg = await msg.edit_media(
+              media=InputMediaPhoto(media=photo_source, caption=text, parse_mode="HTML"),
+              reply_markup=reply_markup
+          )
+          if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
+            BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
+          await state.update_data(bot_msg_id=msg.message_id)
+          return
         except Exception:
-          pass
+          await msg.delete()
+      else:
+        try:
+          await msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
+          await state.update_data(bot_msg_id=msg.message_id)
+          return
+        except Exception:
+          await msg.delete()
+    except Exception:
+      pass
+
+    # Fallback для Callback
+    try:
+      if photo_source:
         new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
         if banner_name not in BANNER_CACHE and new_msg.photo:
           BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
-        await state.update_data(bot_msg_id=new_msg.message_id)
-        return
-    else:
-      try:
-        await msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
-      except Exception:
-        try:
-          new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
-          await state.update_data(bot_msg_id=new_msg.message_id)
-        except Exception:
-          pass
-        return
-    await state.update_data(bot_msg_id=msg.message_id)
+      else:
+        new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+      await state.update_data(bot_msg_id=new_msg.message_id)
+    except Exception as e:
+      logger.error(f"Ошибка отправки в render_step (callback): {e}")
   else:
+    # Удаляем сообщение пользователя
     try:
       await event.delete()
     except Exception:
       pass
 
+    # Пытаемся отредактировать предыдущее сообщение бота
     if bot_msg_id:
       try:
         if photo_source:
@@ -334,6 +341,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
           )
           if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
             BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
+          return
         else:
           await bot.edit_message_text(
               chat_id=chat_id,
@@ -342,17 +350,21 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
               reply_markup=reply_markup,
               parse_mode="HTML"
           )
-        return
+          return
       except Exception:
         pass
 
-    if photo_source:
-      new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
-      if banner_name not in BANNER_CACHE and new_msg.photo:
-        BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
-    else:
-      new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
-    await state.update_data(bot_msg_id=new_msg.message_id)
+    # Обязательный Fallback: если редактирование не удалось, шлем новое сообщение и обновляем bot_msg_id
+    try:
+      if photo_source:
+        new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        if banner_name not in BANNER_CACHE and new_msg.photo:
+          BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
+      else:
+        new_msg = await bot.send_message(chat_id=chat_id, text=text, reply_markup=reply_markup, parse_mode="HTML")
+      await state.update_data(bot_msg_id=new_msg.message_id)
+    except Exception as e:
+      logger.error(f"Ошибка отправки в render_step (message): {e}")
 
 
 # === ГЛАВНОЕ МЕНЮ (КИБЕР) С ИНВЕРТИРОВАННЫМИ ЦВЕТАМИ КНОПОК ===
@@ -362,7 +374,6 @@ async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
 
-  # Цвета кнопок ровно наоборот первому боту: Заказать и Поддержка — primary (фиолетовые), а остальные — danger
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text="🛒 Заказать", callback_data="catalog_services", style="primary")],
@@ -373,7 +384,6 @@ async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
           [InlineKeyboardButton(text="💬 Поддержка", callback_data="contact_admin", style="primary")],
       ]
   )
-  # Точное описание первого бота + название ARENA SHOP — КИБЕР
   text = (
       "💻 <b>ARENA SHOP — КИБЕР</b>\n\n"
       "<i>Добро пожаловать в сервис. Все конфиденциально, быстро и безопасно. Работаем 24/7.</i>\n\n"
@@ -812,7 +822,7 @@ async def process_target_username(message: Message, state: FSMContext):
       [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
       [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]
   ])
-  await render_step(callback, state, "summary.jpg", summary_text, keyboard)
+  await render_step(message, state, "summary.jpg", summary_text, keyboard)
 
 
 @router.callback_query(F.data == "go_to_payment")
