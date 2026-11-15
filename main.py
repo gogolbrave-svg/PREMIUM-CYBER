@@ -134,13 +134,6 @@ class SupportForm(StatesGroup):
   message_text = State()
 
 
-class VacancyForm(StatesGroup):
-  skills = State()
-  experience = State()
-  salary = State()
-  username = State()
-
-
 # Словари и базы в памяти для отслеживания активности и реквизитов
 KNOWN_USERS = {}
 USER_MAPPING = {}      # Кэш для связи username <-> user_id для команды /ban
@@ -367,7 +360,6 @@ async def scheduled_broadcast(bot: Bot):
               f"Действует персональная скидка <b>20%</b> до <b>{target_date.day} {months_ru[target_date.month]}</b>.\n\n"
               "Ждем вас в боте 👇"
           )
-          # Кнопка Заказать во втором боте синяя/фиолетовая (в отличие от первого красной)
           keyboard = InlineKeyboardMarkup(inline_keyboard=[
               [InlineKeyboardButton(text="🟣 ✨ Оформить со скидкой", callback_data="catalog_services")],
               [InlineKeyboardButton(text="🏠 На главную", callback_data="back_home")]
@@ -396,7 +388,6 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
       return
     if user_id in ABANDONED_CHECKOUTS and ABANDONED_CHECKOUTS[user_id]:
       reminder_text = "👋 <b>Завершить оформление?</b>\n\nВы остановились на этапе оплаты. Возвращайтесь к оформлению 👇"
-      # Кнопка заказа фиолетовая/синяя, поддержка тоже фиолетовая (наоборот первому боту)
       keyboard = InlineKeyboardMarkup(inline_keyboard=[
           [InlineKeyboardButton(text="🟣 🛒 Вернуться к заказу", callback_data="catalog_services")],
           [InlineKeyboardButton(text="🟣 💬 Поддержка", callback_data="contact_admin")]
@@ -441,7 +432,6 @@ def get_main_menu_text():
 
 
 def get_main_menu_keyboard():
-  # РОВНО НАОБОРОТ ПЕРВОМУ БОТУ ПО ЦВЕТАМ/СТИЛЮ (Кнопка Заказать фиолетовая, Поддержка фиолетовая)
   return InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text="🟣 Заказать", callback_data="catalog_services")],
