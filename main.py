@@ -903,7 +903,7 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
               InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
           ],
           [
-              InlineKeyboardButton(text="💳 Суммах (UZS)", callback_data="pay_currency_UZS", style="primary"),
+              InlineKeyboardButton(text="💳 Суммы (UZS)", callback_data="pay_currency_UZS", style="primary"),
               InlineKeyboardButton(text="💳 Леи (MLD)", callback_data="pay_currency_MDL", style="danger"),
           ],
           [
