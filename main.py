@@ -895,8 +895,8 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [
-              InlineKeyboardButton(text="💳 Оплатить в рублях", callback_data="pay_currency_RUB", style="primary"),
-              InlineKeyboardButton(text="💳 Оплатить в BYN", callback_data="pay_currency_BYN", style="danger"),
+              InlineKeyboardButton(text="💳 Рубли", callback_data="pay_currency_RUB", style="primary"),
+              InlineKeyboardButton(text="💳 BYN", callback_data="pay_currency_BYN", style="danger"),
           ],
           [
               InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
