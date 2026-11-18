@@ -3,6 +3,7 @@ import datetime
 import logging
 import os
 import random
+import re
 import sqlite3
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, CommandStart
@@ -169,6 +170,8 @@ CURRENCY_CONFIG = {
     "BYN": {"country": "Беларусь", "name": "BYN", "symbol": "BYN"},
     "UAH": {"country": "Украина", "name": "Гривны (UAH)", "symbol": "грн."},
     "KZT": {"country": "Казахстан", "name": "Тенге (KZT)", "symbol": "₸"},
+    "UZS": {"country": "Узбекистан", "name": "Суммах (UZS)", "symbol": "сум"},
+    "MDL": {"country": "Молдова", "name": "Мд. леях (MDL)", "symbol": "лей"},
 }
 
 # === КРИПТОСЕТИ И РЕКВИЗИТЫ ===
@@ -235,7 +238,7 @@ async def get_exchange_rate(target_currency: str) -> float:
     logger.warning(f"Не удалось получить курс для {target_currency}: {e}")
 
   fallback_rates = {
-      "RUB": 95.0, "BYN": 3.3, "KZT": 480.0, "UAH": 41.5,
+      "RUB": 95.0, "BYN": 3.3, "KZT": 480.0, "UAH": 41.5, "UZS": 12500.0, "MDL": 18.0,
   }
   return fallback_rates.get(target_currency, 1.0)
 
@@ -403,6 +406,57 @@ async def cmd_ban_user(message: Message):
     await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> заблокирован.", parse_mode="HTML")
   else:
     await message.reply("❌ Пользователь не найден.")
+
+
+@router.message(Command("ans"))
+async def cmd_admin_answer(message: Message):
+  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    return
+  args = message.text.split(maxsplit=2)
+  if len(args) < 3:
+    await message.reply("❌ Использование: `/ans <user_id> <текст ответа>`", parse_mode="Markdown")
+    return
+  target_user_id_str = args[1].strip()
+  reply_text = args[2].strip()
+  if not target_user_id_str.isdigit():
+    await message.reply("❌ Неверный ID пользователя.")
+    return
+  target_user_id = int(target_user_id_str)
+  try:
+    await message.bot.send_message(
+        chat_id=target_user_id,
+        text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{reply_text}",
+        parse_mode="HTML"
+    )
+    await message.reply(f"✅ Ответ успешно отправлен пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
+  except Exception as e:
+    await message.reply(f"❌ Ошибка отправки: {e}")
+
+
+@router.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
+async def admin_reply_handler(message: Message):
+  reply_msg = message.reply_to_message
+  text_to_parse = (reply_msg.text or "") + (reply_msg.caption or "")
+  
+  match = re.search(r"\(?<code>(\d+)<\/code>\)?", text_to_parse)
+  if not match:
+    match = re.search(r"ID:\s*(\d+)", text_to_parse)
+  if not match:
+    match = re.search(r"\b(\d{6,12})\b", text_to_parse)
+    
+  if match:
+    target_user_id = int(match.group(1))
+    try:
+      await message.bot.send_message(
+          chat_id=target_user_id,
+          text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{message.text}",
+          parse_mode="HTML"
+      )
+      await message.reply(f"✅ Ответ отправлен пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
+    except Exception as e:
+      await message.reply(f"❌ Не удалось отправить сообщение пользователю: {e}")
+  else:
+    await message.reply("❌ Не удалось определить ID пользователя из сообщения, на которое вы ответили.")
 
 
 @router.message(Command("clear_cache"))
@@ -840,14 +894,26 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
   )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="💳 Оплатить в рублях", callback_data="pay_currency_RUB", style="primary")],
-          [InlineKeyboardButton(text="💳 Оплатить в BYN", callback_data="pay_currency_BYN", style="danger")],
-          [InlineKeyboardButton(text="💳 Оплатить в гривнах", callback_data="pay_currency_UAH", style="primary")],
-          [InlineKeyboardButton(text="💳 Оплатить в тенге", callback_data="pay_currency_KZT", style="danger")],
-          [InlineKeyboardButton(text="🤖 CryptoBot (без комиссии)", callback_data="pay_cryptobot", style="primary")],
-          [InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger")],
-          [InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]
+          [
+              InlineKeyboardButton(text="💳 Оплатить в рублях", callback_data="pay_currency_RUB", style="primary"),
+              InlineKeyboardButton(text="💳 Оплатить в BYN", callback_data="pay_currency_BYN", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
+              InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💳 Суммах (UZS)", callback_data="pay_currency_UZS", style="primary"),
+              InlineKeyboardButton(text="💳 Мд. леях (MDL)", callback_data="pay_currency_MDL", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary"),
+              InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary"),
+              InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger"),
+          ]
       ]
   )
   await render_step(callback, state, "payment.jpg", payment_text, keyboard)
