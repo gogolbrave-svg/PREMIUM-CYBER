@@ -157,6 +157,22 @@ def _format_price(amount: float | int) -> str:
   return str(amount)
 
 
+def _build_catalog_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="💣 Снос Telegram аккаунта — 15$", callback_data="srv_Снос_Telegram_аккаунта_15", style="danger")],
+          [InlineKeyboardButton(text="🔍 Доксинг — 30$", callback_data="srv_Доксинг_30", style="primary")],
+          [InlineKeyboardButton(text="⚡️ DDos-атака сайта — 60$", callback_data="srv_DDos-атака_сайта_60", style="danger")],
+          [InlineKeyboardButton(text="📸 Взлом Instagram — 90$", callback_data="srv_Взлом_Instagram_90", style="primary")],
+          [InlineKeyboardButton(text="💬 Взлом Telegram аккаунта — 120$", callback_data="srv_Взлом_Telegram_аккаунта_120", style="danger")],
+          [InlineKeyboardButton(text="💣 Снос TG канала или бота — 180$", callback_data="srv_Снос_TG_канала_или_бота_180", style="primary")],
+          [InlineKeyboardButton(text="🌐 Снос сайта — 250$", callback_data="srv_Снос_сайта_250", style="danger")],
+          [InlineKeyboardButton(text="🛠 Особый заказ — рассчитать стоимость", callback_data="srv_special_order", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")],
+      ]
+  )
+
+
 async def _get_payment_context(user_id: int, state: FSMContext) -> dict:
   data = await state.get_data()
   bill = PENDING_BILLS.get(user_id, {})
@@ -341,7 +357,10 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
     photo_source = FSInputFile(banner_path)
 
   if isinstance(event, CallbackQuery):
-    await event.answer()
+    try:
+      await event.answer()
+    except Exception:
+      pass
     msg = event.message
     try:
       if photo_source:
@@ -355,14 +374,20 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
           await state.update_data(bot_msg_id=msg.message_id)
           return
         except Exception:
-          await msg.delete()
+          try:
+            await msg.delete()
+          except Exception:
+            pass
       else:
         try:
           await msg.edit_text(text, reply_markup=reply_markup, parse_mode="HTML")
           await state.update_data(bot_msg_id=msg.message_id)
           return
         except Exception:
-          await msg.delete()
+          try:
+            await msg.delete()
+          except Exception:
+            pass
     except Exception:
       pass
 
@@ -809,20 +834,8 @@ async def cmd_order(message: Message, state: FSMContext):
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
   await state.set_state(OrderForm.service)
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [InlineKeyboardButton(text="💣 Снос Telegram аккаунта — 15$", callback_data="srv_Снос_Telegram_аккаунта_15", style="danger")],
-          [InlineKeyboardButton(text="🔍 Доксинг — 30$", callback_data="srv_Доксинг_30", style="primary")],
-          [InlineKeyboardButton(text="⚡️ DDos-атака сайта — 60$", callback_data="srv_DDos-атака_сайта_60", style="danger")],
-          [InlineKeyboardButton(text="📸 Взлом Instagram — 90$", callback_data="srv_Взлом_Instagram_90", style="primary")],
-          [InlineKeyboardButton(text="💬 Взлом Telegram аккаунта — 120$", callback_data="srv_Взлом_Telegram_аккаунта_120", style="danger")],
-          [InlineKeyboardButton(text="💣 Снос TG канала или бота — 180$", callback_data="srv_Снос_TG_канала_или_бота_180", style="primary")],
-          [InlineKeyboardButton(text="🌐 Снос сайта — 250$", callback_data="srv_Снос_сайта_250", style="danger")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")],
-      ]
-  )
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
-  await render_step(message, state, "catalog.jpg", text, keyboard)
+  await render_step(message, state, "catalog.jpg", text, _build_catalog_keyboard())
 
 
 @router.message(Command("my_orders"))
@@ -923,10 +936,12 @@ async def process_support_photo(message: Message, state: FSMContext):
   data = await state.get_data()
   user = message.from_user
   user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
-  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {data.get('reason')}"
-  if ADMIN_ID:
+  reason_text = data.get("reason") or "Без описания"
+  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {reason_text}"
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
     try:
-      await message.bot.send_photo(chat_id=ADMIN_ID, photo=photo_id, caption=admin_text, parse_mode="HTML")
+      await message.bot.send_photo(chat_id=uid, photo=photo_id, caption=admin_text, parse_mode="HTML")
     except Exception:
       pass
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
@@ -935,21 +950,25 @@ async def process_support_photo(message: Message, state: FSMContext):
   await state.clear()
 
 
-@router.callback_query(SupportForm.photo, F.data == "skip_support_photo")
+@router.callback_query(F.data == "skip_support_photo")
 async def skip_support_photo(callback: CallbackQuery, state: FSMContext):
+  track_user(callback.from_user)
   data = await state.get_data()
   user = callback.from_user
   user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
-  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {data.get('reason')}"
-  if ADMIN_ID:
+  reason_text = data.get("reason") or (callback.message.caption if callback.message and callback.message.caption else "Обращение без текста")
+  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {reason_text}"
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
     try:
-      await callback.bot.send_message(chat_id=ADMIN_ID, text=admin_text, parse_mode="HTML")
-    except Exception:
-      pass
+      await callback.bot.send_message(chat_id=uid, text=admin_text, parse_mode="HTML")
+    except Exception as e:
+      logger.error(f"Ошибка отправки обращения в поддержку ({uid}): {e}")
+
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
   keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
-  await render_step(message, state, "main.jpg", text, keyboard)
   await state.clear()
+  await render_step(callback, state, "main.jpg", text, keyboard)
 
 
 # === КАТАЛОГ И ОФОРМЛЕНИЕ ЗАКАЗА ===
@@ -961,20 +980,23 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
     task.cancel()
 
   await state.set_state(OrderForm.service)
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [InlineKeyboardButton(text="💣 Снос Telegram аккаунта — 15$", callback_data="srv_Снос_Telegram_аккаунта_15", style="danger")],
-          [InlineKeyboardButton(text="🔍 Доксинг — 30$", callback_data="srv_Доксинг_30", style="primary")],
-          [InlineKeyboardButton(text="⚡️ DDos-атака сайта — 60$", callback_data="srv_DDos-атака_сайта_60", style="danger")],
-          [InlineKeyboardButton(text="📸 Взлом Instagram — 90$", callback_data="srv_Взлом_Instagram_90", style="primary")],
-          [InlineKeyboardButton(text="💬 Взлом Telegram аккаунта — 120$", callback_data="srv_Взлом_Telegram_аккаунта_120", style="danger")],
-          [InlineKeyboardButton(text="💣 Снос TG канала или бота — 180$", callback_data="srv_Снос_TG_канала_или_бота_180", style="primary")],
-          [InlineKeyboardButton(text="🌐 Снос сайта — 250$", callback_data="srv_Снос_сайта_250", style="danger")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")],
-      ]
-  )
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
-  await render_step(callback, state, "catalog.jpg", text, keyboard)
+  await render_step(callback, state, "catalog.jpg", text, _build_catalog_keyboard())
+
+
+@router.callback_query(OrderForm.service, F.data == "srv_special_order")
+async def process_special_order_service(callback: CallbackQuery, state: FSMContext):
+  service_name = "Особый заказ — рассчитать стоимость"
+  await state.update_data(service_name=service_name, total_price=0)
+  await state.set_state(OrderForm.target_username)
+
+  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]])
+  text = (
+      f"🛠 Услуга: <b>{service_name}</b>\n\n"
+      f"🎯 <b>Данные цели и задачи</b>\n\n"
+      f"Опишите задачу и укажите юзернейм или ссылку на цель следующим сообщением — менеджер рассчитает стоимость и выставит счёт:"
+  )
+  await render_step(callback, state, "target_data.jpg", text, keyboard)
 
 
 @router.callback_query(OrderForm.service, F.data.startswith("srv_"))
@@ -1006,17 +1028,42 @@ async def process_target_username(message: Message, state: FSMContext):
   track_user(message.from_user)
   await state.update_data(target_username=message.text.strip())
   data = await state.get_data()
-  
+  price = data.get("total_price", 0)
+  price_display = "Рассчитывается менеджером" if not price else f"{price}$"
+
   summary_text = (
       "✨ <b>Сводка заказа:</b>\n\n"
       f"• Услуга: <b>{data.get('service_name')}</b>\n"
       f"{get_order_details_text(data)}"
-      f"💵 <b>Сумма к оплате: {data.get('total_price')}$</b>"
+      f"💵 <b>Сумма к оплате: {price_display}</b>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]
-  ])
+  if not price:
+    user = message.from_user
+    user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+    notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+    for uid in notify_ids:
+      try:
+        await message.bot.send_message(
+            chat_id=uid,
+            text=(
+                f"🛠 <b>Заявка на особый заказ (расчёт стоимости)</b>\n\n"
+                f"• Клиент: {user_info} (<code>{user.id}</code>)\n"
+                f"• Детали: {message.text.strip()}\n\n"
+                f"Выставить счёт: <code>/bill {user.id} особый заказ 220$</code>"
+            ),
+            parse_mode="HTML",
+        )
+      except Exception:
+        pass
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать менеджеру", callback_data="contact_admin", style="primary")],
+        [InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="danger")]
+    ])
+  else:
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]
+    ])
   await render_step(message, state, "summary.jpg", summary_text, keyboard)
 
 
