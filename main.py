@@ -547,7 +547,7 @@ async def cmd_manager_send(message: Message):
   try:
     await message.bot.send_message(
         chat_id=target_user_id,
-        text=out_text,
+        text=f"💬 <b>Сообщение от менеджера:</b>\n\n{out_text}",
         parse_mode="HTML",
     )
     await message.reply(f"✅ Сообщение отправлено пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
@@ -951,7 +951,7 @@ async def process_support_photo(message: Message, state: FSMContext):
   await state.clear()
 
 
-@router.callback_query(F.data == "skip_support_photo")
+@router.callback_query(SupportForm.photo, F.data == "skip_support_photo")
 async def skip_support_photo(callback: CallbackQuery, state: FSMContext):
   track_user(callback.from_user)
   data = await state.get_data()
