@@ -26,6 +26,8 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
 ADMIN_ID_env = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_env) if ADMIN_ID_env and ADMIN_ID_env.isdigit() else 0
+MANAGER_ID_env = os.getenv("MANAGER_ID")
+MANAGER_ID = int(MANAGER_ID_env) if MANAGER_ID_env and MANAGER_ID_env.isdigit() else 0
 
 if not BOT_TOKEN:
   raise ValueError("❌ BOT_TOKEN не найден!")
@@ -137,8 +139,64 @@ ABANDONED_CHECKOUTS = {}
 CARD_DETAILS = []      # Список реквизитов карт/телефонов
 CARD_POINTERS = {}     # Индексы для циклического чередования реквизитов по странам
 BANNER_CACHE = {}      # Кэш file_id баннеров для мгновенной загрузки
+PENDING_BILLS = {}     # Выставленные менеджером счета по user_id
 
 router = Router()
+
+
+def is_manager_authorized(user_id: int) -> bool:
+  allowed_ids = {uid for uid in (MANAGER_ID, ADMIN_ID) if uid}
+  if not allowed_ids:
+    return True
+  return user_id in allowed_ids
+
+
+def _format_price(amount: float | int) -> str:
+  if isinstance(amount, float) and amount.is_integer():
+    return str(int(amount))
+  return str(amount)
+
+
+async def _get_payment_context(user_id: int, state: FSMContext) -> dict:
+  data = await state.get_data()
+  bill = PENDING_BILLS.get(user_id, {})
+  total_price = data.get("total_price")
+  if total_price is None:
+    total_price = bill.get("total_price", 10)
+  service_name = data.get("service_name") or bill.get("service_name") or "Особый заказ"
+  target_username = data.get("target_username") or bill.get("target_username") or "По счету менеджера"
+  return {
+      "total_price": total_price,
+      "service_name": service_name,
+      "target_username": target_username,
+  }
+
+
+def _build_payment_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(text="💳 Рубли", callback_data="pay_currency_RUB", style="primary"),
+              InlineKeyboardButton(text="💳 BYN", callback_data="pay_currency_BYN", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
+              InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💳 Суммы (UZS)", callback_data="pay_currency_UZS", style="primary"),
+              InlineKeyboardButton(text="💳 Леи (MLD)", callback_data="pay_currency_MDL", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary"),
+              InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger"),
+          ],
+          [
+              InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary"),
+              InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger"),
+          ]
+      ]
+  )
 
 
 # === MIDDLEWARE ДЛЯ ПРОВЕРКИ БАНА ===
@@ -390,7 +448,87 @@ async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
   await render_step(event, state, "main.jpg", text, keyboard)
 
 
-# === АДМИНСКИЕ КОМАНДЫ ===
+# === АДМИНСКИЕ И МЕНЕДЖЕРСКИЕ КОМАНДЫ ===
+@router.message(Command("bill"))
+async def cmd_manager_bill(message: Message):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
+    await message.reply("❌ Использование: `/bill <user_id> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
+    return
+
+  parts = args[1].strip().split()
+  if len(parts) < 2 or not parts[0].isdigit():
+    await message.reply("❌ Неверный формат. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
+    return
+
+  target_user_id = int(parts[0])
+  raw_amount = parts[-1].rstrip("$").strip()
+  try:
+    amount = float(raw_amount)
+  except ValueError:
+    await message.reply("❌ Неверная сумма. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
+    return
+
+  service_name = " ".join(parts[1:-1]).strip() if len(parts) > 2 else "Особый заказ"
+  if not service_name:
+    service_name = "Особый заказ"
+
+  PENDING_BILLS[target_user_id] = {
+      "service_name": service_name,
+      "total_price": amount,
+      "target_username": "По счету менеджера",
+  }
+
+  price_str = _format_price(amount)
+  bill_text = (
+      f"🧾 <b>Вам выставлен счет на {service_name}</b>\n\n"
+      f"• Услуга: <b>{service_name}</b>\n"
+      f"• Сумма к оплате: <b>{price_str}$</b>\n\n"
+      f"Выберите страну / валюту или способ оплаты ниже, чтобы получить реквизиты:"
+  )
+  try:
+    await message.bot.send_message(
+        chat_id=target_user_id,
+        text=bill_text,
+        reply_markup=_build_payment_keyboard(),
+        parse_mode="HTML",
+    )
+    await message.reply(
+        f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>.",
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    await message.reply(f"❌ Не удалось отправить счет пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
+
+
+@router.message(Command("send"))
+async def cmd_manager_send(message: Message):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  args = message.text.split(maxsplit=2)
+  if len(args) < 3 or not args[1].strip().isdigit():
+    await message.reply("❌ Использование: `/send <user_id> <сообщение>`\nПример: `/send 282810030 Привет! Счет готов.`", parse_mode="Markdown")
+    return
+
+  target_user_id = int(args[1].strip())
+  out_text = args[2].strip()
+  if not out_text:
+    await message.reply("❌ Сообщение не может быть пустым.")
+    return
+
+  try:
+    await message.bot.send_message(
+        chat_id=target_user_id,
+        text=out_text,
+        parse_mode="HTML",
+    )
+    await message.reply(f"✅ Сообщение отправлено пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
+  except Exception as e:
+    await message.reply(f"❌ Ошибка отправки пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
+
+
 @router.message(Command("ban"))
 async def cmd_ban_user(message: Message):
   if ADMIN_ID and message.from_user.id != ADMIN_ID:
@@ -885,8 +1023,8 @@ async def process_target_username(message: Message, state: FSMContext):
 @router.callback_query(F.data == "go_to_payment")
 async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
   user_id = callback.from_user.id
-  data = await state.get_data()
-  total_price = data.get("total_price", 10)
+  ctx = await _get_payment_context(user_id, state)
+  total_price = ctx["total_price"]
 
   if user_id in ABANDONED_CHECKOUTS:
     task = ABANDONED_CHECKOUTS.pop(user_id, None)
@@ -898,33 +1036,9 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
       "⏳ <b>Оплата заказа</b>\n"
       "Время на завершение: <b><u>20:00</u></b>\n\n"
       f"💳 <b>Выберите способ оплаты</b>\n"
-      f"Сумма: <b>{total_price}$</b>"
+      f"Сумма: <b>{_format_price(total_price)}$</b>"
   )
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[
-          [
-              InlineKeyboardButton(text="💳 Рубли", callback_data="pay_currency_RUB", style="primary"),
-              InlineKeyboardButton(text="💳 BYN", callback_data="pay_currency_BYN", style="danger"),
-          ],
-          [
-              InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
-              InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
-          ],
-          [
-              InlineKeyboardButton(text="💳 Суммы (UZS)", callback_data="pay_currency_UZS", style="primary"),
-              InlineKeyboardButton(text="💳 Леи (MLD)", callback_data="pay_currency_MDL", style="danger"),
-          ],
-          [
-              InlineKeyboardButton(text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary"),
-              InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger"),
-          ],
-          [
-              InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary"),
-              InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger"),
-          ]
-      ]
-  )
-  await render_step(callback, state, "payment.jpg", payment_text, keyboard)
+  await render_step(callback, state, "payment.jpg", payment_text, _build_payment_keyboard())
 
 
 @router.callback_query(F.data.startswith("pay_currency_"))
@@ -933,8 +1047,8 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
   config = CURRENCY_CONFIG.get(curr_code, {"country": "Россия", "name": "Рубли", "symbol": "₽"})
   country = config["country"]
 
-  data = await state.get_data()
-  total_price = data.get("total_price", 10)
+  ctx = await _get_payment_context(callback.from_user.id, state)
+  total_price = ctx["total_price"]
   rate = await get_exchange_rate(curr_code)
   local_amount = round(total_price * rate)
 
@@ -954,10 +1068,12 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
     await render_step(callback, state, "payment.jpg", text, keyboard)
     return
 
+  sbp_line = "<b>Метод:</b> СБП / Перевод\n" if curr_code == "RUB" else ""
   text = (
       f"💳 <b>Оплата ({config['name']})</b>\n\n"
-      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({total_price}$)</i>\n\n"
+      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_price(total_price)}$)</i>\n\n"
       f"⚠️ <b>Переводите строго на реквизиты ниже:</b>\n\n"
+      f"{sbp_line}"
       f"<b>Банк:</b> {card['bank']}\n"
       f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
       "💡 <i>После перевода нажмите кнопку ниже для отправки чека.</i>"
@@ -971,10 +1087,11 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "payment_help_manager")
 async def process_payment_help_manager(callback: CallbackQuery):
-  if ADMIN_ID:
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
     try:
       user = callback.from_user
-      await callback.bot.send_message(chat_id=ADMIN_ID, text=f"🚨 Запрос помощи с оплатой от @{user.username} (<code>{user.id}</code>)", parse_mode="HTML")
+      await callback.bot.send_message(chat_id=uid, text=f"🚨 Запрос помощи с оплатой от @{user.username} (<code>{user.id}</code>)", parse_mode="HTML")
     except Exception:
       pass
   await callback.answer("✅ Менеджер уведомлен, скоро свяжется с вами.", show_alert=True)
@@ -982,8 +1099,8 @@ async def process_payment_help_manager(callback: CallbackQuery):
 
 @router.callback_query(F.data == "pay_cryptobot")
 async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
-  data = await state.get_data()
-  total_price = data.get("total_price", 10)
+  ctx = await _get_payment_context(callback.from_user.id, state)
+  total_price = ctx["total_price"]
 
   pay_url, inv_id = await create_cryptobot_invoice(total_price, "Оплата услуг")
   if not pay_url:
@@ -998,7 +1115,7 @@ async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")],
       ]
   )
-  text = f"🤖 <b>CryptoBot</b>\n\nСумма: <b>{total_price} USDT</b>\n\nПосле оплаты нажмите кнопку проверки:"
+  text = f"🤖 <b>CryptoBot</b>\n\nСумма: <b>{_format_price(total_price)} USDT</b>\n\nПосле оплаты нажмите кнопку проверки:"
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
@@ -1017,17 +1134,21 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   if task:
     task.cancel()
 
-  service_name = data.get("service_name")
-  total_price = data.get("total_price")
-  target_info = f"Цель: {data.get('target_username')}"
+  ctx = await _get_payment_context(user.id, state)
+  service_name = ctx["service_name"]
+  total_price = ctx["total_price"]
+  target_username = ctx["target_username"]
+  target_info = f"Цель: {target_username}"
 
   add_order_to_db(user.id, service_name, total_price, "✅ Оплачено через CryptoBot", target_info)
+  PENDING_BILLS.pop(user.id, None)
 
-  if ADMIN_ID:
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
     try:
       await callback.bot.send_message(
-          chat_id=ADMIN_ID,
-          text=f"🤖 Успешная оплата CryptoBot от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {data.get('target_username')}",
+          chat_id=uid,
+          text=f"🤖 Успешная оплата CryptoBot от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {target_username}",
           parse_mode="HTML"
       )
     except Exception:
@@ -1062,12 +1183,12 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
     await callback.answer("Сеть не найдена", show_alert=True)
     return
 
-  data = await state.get_data()
-  total_price = data.get("total_price", 10)
+  ctx = await _get_payment_context(callback.from_user.id, state)
+  total_price = ctx["total_price"]
 
   text = (
       f"💳 <b>Оплата {net_info['name']}</b>\n\n"
-      f"• Сумма: <b>{total_price}$</b>\n"
+      f"• Сумма: <b>{_format_price(total_price)}$</b>\n"
       f"• Сеть: <b>{net_info['network']}</b>\n"
       f"• Реквизиты:\n<code>{net_info['address']}</code>\n\n"
       "💡 <i>После перевода прикрепите чек.</i>"
@@ -1093,20 +1214,23 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
-  data = await state.get_data()
 
-  service_name = data.get("service_name")
-  total_price = data.get("total_price")
-  target_info = f"Цель: {data.get('target_username')}"
+  ctx = await _get_payment_context(user.id, state)
+  service_name = ctx["service_name"]
+  total_price = ctx["total_price"]
+  target_username = ctx["target_username"]
+  target_info = f"Цель: {target_username}"
 
   add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
+  PENDING_BILLS.pop(user.id, None)
 
-  if ADMIN_ID:
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
     try:
       await message.bot.send_photo(
-          chat_id=ADMIN_ID,
+          chat_id=uid,
           photo=message.photo[-1].file_id,
-          caption=f"🛒 Новый чек от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {data.get('target_username')}\n• Сумма: {total_price}$",
+          caption=f"🛒 Новый чек от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {target_username}\n• Сумма: {_format_price(total_price)}$",
           parse_mode="HTML"
       )
     except Exception:
