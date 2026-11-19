@@ -167,7 +167,7 @@ def _build_catalog_keyboard() -> InlineKeyboardMarkup:
           [InlineKeyboardButton(text="💬 Взлом Telegram аккаунта — 120$", callback_data="srv_Взлом_Telegram_аккаунта_120", style="danger")],
           [InlineKeyboardButton(text="💣 Снос TG канала или бота — 180$", callback_data="srv_Снос_TG_канала_или_бота_180", style="primary")],
           [InlineKeyboardButton(text="🌐 Снос сайта — 250$", callback_data="srv_Снос_сайта_250", style="danger")],
-          [InlineKeyboardButton(text="🛠 Особый заказ — рассчитать стоимость", callback_data="srv_special_order", style="primary")],
+          [InlineKeyboardButton(text="🛠 Особый заказ — Рассчитать стоимость", callback_data="srv_special_order", style="primary")],
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")],
       ]
   )
@@ -986,7 +986,7 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(OrderForm.service, F.data == "srv_special_order")
 async def process_special_order_service(callback: CallbackQuery, state: FSMContext):
-  service_name = "Особый заказ — рассчитать стоимость"
+  service_name = "Особый заказ — Рассчитать стоимость"
   await state.update_data(service_name=service_name, total_price=0)
   await state.set_state(OrderForm.target_username)
 
@@ -1046,7 +1046,7 @@ async def process_target_username(message: Message, state: FSMContext):
         await message.bot.send_message(
             chat_id=uid,
             text=(
-                f"🛠 <b>Заявка на особый заказ (расчёт стоимости)</b>\n\n"
+                f"🛠 <b>Заявка на особый заказ (Рассчитать стоимость)</b>\n\n"
                 f"• Клиент: {user_info} (<code>{user.id}</code>)\n"
                 f"• Детали: {message.text.strip()}\n\n"
                 f"Выставить счёт: <code>/bill {user.id} особый заказ 220$</code>"
