@@ -610,10 +610,12 @@ async def _get_payment_context(user_id: int, state: FSMContext) -> dict:
     total_price = bill.get("total_price", 10)
   service_name = data.get("service_name") or bill.get("service_name") or "Особый заказ"
   target_username = data.get("target_username") or bill.get("target_username") or "По счету менеджера"
+  payment_method = data.get("payment_method") or "card"
   return {
       "total_price": total_price,
       "service_name": service_name,
       "target_username": target_username,
+      "payment_method": payment_method,
   }
 
 
@@ -1843,6 +1845,7 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("pay_currency_"))
 async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
+  await state.update_data(payment_method="card")
   curr_code = callback.data.split("_")[2]
   config = CURRENCY_CONFIG.get(curr_code, {"country": "Россия", "name": "Рубли", "symbol": "₽"})
   country = config["country"]
@@ -1877,7 +1880,7 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
       f"{sbp_line}"
       f"<b>Банк:</b> {card['bank']}\n"
       f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
-      "💡 <i>После перевода нажмите кнопку ниже для отправки чека.</i>"
+      "💡 <i>После перевода нажмите кнопку ниже для отправки чека или квитанции.</i>"
   )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -1980,6 +1983,7 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "crypto_expert")
 async def process_crypto_expert(callback: CallbackQuery, state: FSMContext):
+  await state.update_data(payment_method="crypto")
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text="💎 USDT (TRC-20)", callback_data="pay_crypto_trc20", style="primary")],
@@ -1995,6 +1999,7 @@ async def process_crypto_expert(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data.startswith("pay_crypto_"))
 async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
+  await state.update_data(payment_method="crypto")
   net_key = callback.data.split("_")[2]
   net_info = CRYPTO_NETWORKS.get(net_key)
   if not net_info:
@@ -2026,7 +2031,7 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
       f"• Монета: <b>{wallet['asset']}</b>\n"
       f"• Сеть: <b>{wallet['network']}</b>\n"
       f"• Реквизиты:\n<code>{wallet['address']}</code>\n\n"
-      "💡 <i>После перевода прикрепите чек.</i>"
+      "💡 <i>После перевода прикрепите скриншот оплаты перевода.</i>"
   )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -2040,10 +2045,14 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "ask_for_receipt")
 async def ask_for_receipt(callback: CallbackQuery, state: FSMContext):
   await state.set_state(OrderForm.receipt)
+  ctx = await _get_payment_context(callback.from_user.id, state)
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]]
   )
-  text = "🧾 Отправьте скриншот или фото чека следующим сообщением:"
+  if ctx["payment_method"] == "crypto":
+    text = "🧾 Отправьте фото скриншот оплаты перевода следующим сообщением:"
+  else:
+    text = "🧾 Отправьте фото чека или документ квитанции об оплате следующим сообщением:"
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
@@ -2089,6 +2098,52 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   await state.clear()
 
 
+@router.message(OrderForm.receipt, F.document)
+async def process_receipt_document(message: Message, state: FSMContext):
+  ctx = await _get_payment_context(message.from_user.id, state)
+  if ctx["payment_method"] == "crypto":
+    await message.reply("⚠️ Для оплаты криптой отправьте, пожалуйста, фото скриншот оплаты перевода.")
+    return
+
+  user = message.from_user
+  task = ABANDONED_CHECKOUTS.pop(user.id, None)
+  if task:
+    task.cancel()
+
+  service_name = ctx["service_name"]
+  total_price = ctx["total_price"]
+  target_username = ctx["target_username"]
+  target_info = f"Цель: {target_username}"
+
+  await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
+  PENDING_BILLS.pop(user.id, None)
+  await delete_pending_bill_db(user.id)
+
+  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
+  for uid in notify_ids:
+    try:
+      await message.bot.send_document(
+          chat_id=uid,
+          document=message.document.file_id,
+          caption=(
+              f"🛒 Новая квитанция (документ) от @{user.username} (<code>{user.id}</code>)\n"
+              f"• Услуга: {service_name}\n"
+              f"• Цель: {target_username}\n"
+              f"• К оплате: {_format_price(total_price)} USDT"
+          ),
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+
+  text = "✅ Квитанция получена! Менеджер проверит платеж в течение 25 минут."
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
+  await render_step(message, state, "main.jpg", text, keyboard)
+  await state.clear()
+
+
 # === ЗАЩИТНЫЕ (FALLBACK) ХЕНДЛЕРЫ ===
 @router.message(OrderForm.target_username)
 async def fallback_target_username(message: Message):
@@ -2101,8 +2156,12 @@ async def fallback_special_link(message: Message):
 
 
 @router.message(OrderForm.receipt)
-async def fallback_order_receipt(message: Message):
-  await message.reply("⚠️ Пожалуйста, отправьте скриншот или фото чека об оплате.")
+async def fallback_order_receipt(message: Message, state: FSMContext):
+  ctx = await _get_payment_context(message.from_user.id, state)
+  if ctx["payment_method"] == "crypto":
+    await message.reply("⚠️ Пожалуйста, отправьте фото скриншот оплаты перевода.")
+  else:
+    await message.reply("⚠️ Пожалуйста, отправьте фото чека или документ квитанции об оплате.")
 
 
 @router.message(SupportForm.reason)
