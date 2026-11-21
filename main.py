@@ -1276,6 +1276,89 @@ async def cmd_freeze_requisites(message: Message):
     await message.reply("❌ Не найдено.")
 
 
+@router.message(Command("list"))
+async def cmd_list_requisites(message: Message):
+  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+    return
+
+  now = datetime.datetime.now()
+  cards_changed = False
+  wallets_changed = False
+
+  active_cards = []
+  frozen_cards = []
+  for card in CARD_DETAILS:
+    frozen_until = card.get("frozen_until")
+    if frozen_until and frozen_until > now:
+      frozen_cards.append((card, frozen_until))
+    else:
+      if frozen_until is not None:
+        card["frozen_until"] = None
+        cards_changed = True
+      active_cards.append(card)
+
+  active_wallets = []
+  frozen_wallets = []
+  for wallet in CRYPTO_WALLETS:
+    frozen_until = wallet.get("frozen_until")
+    if frozen_until and frozen_until > now:
+      frozen_wallets.append((wallet, frozen_until))
+    else:
+      if frozen_until is not None:
+        wallet["frozen_until"] = None
+        wallets_changed = True
+      active_wallets.append(wallet)
+
+  if cards_changed:
+    await sync_card_details_db()
+  if wallets_changed:
+    await sync_crypto_wallets_db()
+
+  lines = ["📋 <b>Список актуальных реквизитов:</b>\n"]
+
+  lines.append("💳 <b>Карты / СБП / Номера (актуальные):</b>")
+  if active_cards:
+    for idx, c in enumerate(active_cards, start=1):
+      lines.append(f"{idx}. 🌍 {c['country']} | 🏦 {c['bank']} — <code>{c['details']}</code>")
+  else:
+    lines.append("<i>Нет активных реквизитов.</i>")
+
+  lines.append("\n🪙 <b>Крипта (актуальные):</b>")
+  if active_wallets:
+    for idx, w in enumerate(active_wallets, start=1):
+      lines.append(f"{idx}. 🪙 {w['asset']} | 🌐 {w['network']} — <code>{w['address']}</code>")
+  else:
+    lines.append("<i>Нет активных кошельков.</i>")
+
+  lines.append("\n❄️ <b>Зафриженные на 24 часа (недоступны):</b>")
+  has_frozen = bool(frozen_cards or frozen_wallets)
+  if not has_frozen:
+    lines.append("<i>Нет зафриженных реквизитов.</i>")
+  else:
+    if frozen_cards:
+      lines.append("💳 <i>Карты / СБП / Номера:</i>")
+      for idx, (c, until_dt) in enumerate(frozen_cards, start=1):
+        rem = until_dt - now
+        rem_hours = max(1, int(rem.total_seconds() // 3600))
+        rem_mins = int((rem.total_seconds() % 3600) // 60)
+        lines.append(
+            f"{idx}. 🌍 {c['country']} | 🏦 {c['bank']} — <code>{c['details']}</code> "
+            f"(до {until_dt.strftime('%d.%m %H:%M')}, ост. {rem_hours}ч {rem_mins}м)"
+        )
+    if frozen_wallets:
+      lines.append("🪙 <i>Крипта:</i>")
+      for idx, (w, until_dt) in enumerate(frozen_wallets, start=1):
+        rem = until_dt - now
+        rem_hours = max(1, int(rem.total_seconds() // 3600))
+        rem_mins = int((rem.total_seconds() % 3600) // 60)
+        lines.append(
+            f"{idx}. 🪙 {w['asset']} | 🌐 {w['network']} — <code>{w['address']}</code> "
+            f"(до {until_dt.strftime('%d.%m %H:%M')}, ост. {rem_hours}ч {rem_mins}м)"
+        )
+
+  await message.reply("\n".join(lines), parse_mode="HTML")
+
+
 # === CRYPTOBOT ИНТЕГРАЦИЯ ===
 async def create_cryptobot_invoice(amount_usd: float, description: str):
   if not CRYPTO_BOT_TOKEN:
