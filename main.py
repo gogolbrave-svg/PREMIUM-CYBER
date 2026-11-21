@@ -58,6 +58,7 @@ class SupportForm(StatesGroup):
 
 # Словари и кэши в памяти (синхронизируются с БД)
 KNOWN_USERS = {}
+LAST_BROADCAST = {}
 USER_MAPPING = {}
 ABANDONED_CHECKOUTS = {}
 CARD_DETAILS = []
@@ -99,10 +100,15 @@ def _init_sqlite_db():
           CREATE TABLE IF NOT EXISTS users (
               user_id BIGINT PRIMARY KEY,
               username TEXT,
-              last_seen TEXT
+              last_seen TEXT,
+              last_broadcast TEXT
           )
       """
     )
+    cols = [row[1] for row in cursor.execute("PRAGMA table_info(users)").fetchall()]
+    if "last_broadcast" not in cols:
+      cursor.execute("ALTER TABLE users ADD COLUMN last_broadcast TEXT")
+
     cursor.execute(
         """
           CREATE TABLE IF NOT EXISTS card_details (
@@ -132,6 +138,14 @@ def _init_sqlite_db():
               service_name TEXT,
               total_price REAL,
               target_username TEXT
+          )
+      """
+    )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS abandoned_reminders (
+              user_id BIGINT PRIMARY KEY,
+              remind_at TEXT
           )
       """
     )
@@ -170,8 +184,14 @@ async def init_db():
               CREATE TABLE IF NOT EXISTS users (
                   user_id BIGINT PRIMARY KEY,
                   username TEXT,
-                  last_seen TEXT
+                  last_seen TEXT,
+                  last_broadcast TEXT
               )
+          """
+        )
+        await conn.execute(
+            """
+              ALTER TABLE users ADD COLUMN IF NOT EXISTS last_broadcast TEXT
           """
         )
         await conn.execute(
@@ -206,16 +226,24 @@ async def init_db():
               )
           """
         )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS abandoned_reminders (
+                  user_id BIGINT PRIMARY KEY,
+                  remind_at TEXT
+              )
+          """
+        )
       logger.info("✅ PostgreSQL подключена и таблицы инициализированы.")
     except Exception as e:
       logger.error(f"❌ Ошибка подключения к PostgreSQL, используется SQLite: {e}")
       PG_POOL = None
 
 
-async def load_persistent_state():
+async def load_persistent_state(bot: Bot | None = None):
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
-      u_rows = await conn.fetch("SELECT user_id, username, last_seen FROM users")
+      u_rows = await conn.fetch("SELECT user_id, username, last_seen, last_broadcast FROM users")
       for r in u_rows:
         uid = int(r["user_id"])
         USER_MAPPING[uid] = r["username"]
@@ -226,6 +254,11 @@ async def load_persistent_state():
             KNOWN_USERS[uid] = datetime.datetime.fromisoformat(r["last_seen"])
           except Exception:
             KNOWN_USERS[uid] = datetime.datetime.now()
+        if r["last_broadcast"]:
+          try:
+            LAST_BROADCAST[uid] = datetime.datetime.fromisoformat(r["last_broadcast"])
+          except Exception:
+            pass
 
       c_rows = await conn.fetch("SELECT details, bank, country, frozen_until FROM card_details")
       CARD_DETAILS.clear()
@@ -255,10 +288,15 @@ async def load_persistent_state():
             "total_price": float(r["total_price"]),
             "target_username": r["target_username"],
         }
+
+      rem_rows = await conn.fetch("SELECT user_id, remind_at FROM abandoned_reminders")
+      reminders_data = [(int(r["user_id"]), r["remind_at"]) for r in rem_rows]
   else:
     with sqlite3.connect("bot_database.db") as conn:
       cursor = conn.cursor()
-      for uid, uname, last_seen in cursor.execute("SELECT user_id, username, last_seen FROM users").fetchall():
+      for uid, uname, last_seen, last_broadcast in cursor.execute(
+          "SELECT user_id, username, last_seen, last_broadcast FROM users"
+      ).fetchall():
         USER_MAPPING[uid] = uname
         if uname:
           USER_MAPPING[uname.lower().lstrip("@")] = uid
@@ -267,6 +305,11 @@ async def load_persistent_state():
             KNOWN_USERS[uid] = datetime.datetime.fromisoformat(last_seen)
           except Exception:
             KNOWN_USERS[uid] = datetime.datetime.now()
+        if last_broadcast:
+          try:
+            LAST_BROADCAST[uid] = datetime.datetime.fromisoformat(last_broadcast)
+          except Exception:
+            pass
 
       CARD_DETAILS.clear()
       for details, bank, country, frozen_until in cursor.execute(
@@ -300,17 +343,39 @@ async def load_persistent_state():
             "target_username": tuser,
         }
 
+      reminders_data = [
+          (int(r[0]), r[1])
+          for r in cursor.execute("SELECT user_id, remind_at FROM abandoned_reminders").fetchall()
+      ]
+
+  if bot:
+    now = datetime.datetime.now()
+    for uid, remind_at_str in reminders_data:
+      try:
+        remind_at = datetime.datetime.fromisoformat(remind_at_str)
+        delay = max(0.0, (remind_at - now).total_seconds())
+      except Exception:
+        delay = 0.0
+      old_task = ABANDONED_CHECKOUTS.pop(uid, None)
+      if old_task:
+        old_task.cancel()
+      ABANDONED_CHECKOUTS[uid] = asyncio.create_task(
+          delayed_abandoned_cart_reminder(bot, uid, delay_seconds=delay)
+      )
+
 
 async def save_user_to_db(user):
   if not user:
     return
-  now_iso = datetime.datetime.now().isoformat()
+  now_dt = datetime.datetime.now()
+  now_iso = now_dt.isoformat()
+  KNOWN_USERS[user.id] = now_dt
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
       await conn.execute(
           """
-            INSERT INTO users (user_id, username, last_seen)
-            VALUES ($1, $2, $3)
+            INSERT INTO users (user_id, username, last_seen, last_broadcast)
+            VALUES ($1, $2, $3, NULL)
             ON CONFLICT (user_id) DO UPDATE
             SET username = COALESCE(EXCLUDED.username, users.username),
                 last_seen = EXCLUDED.last_seen
@@ -323,14 +388,79 @@ async def save_user_to_db(user):
     with sqlite3.connect("bot_database.db") as conn:
       conn.execute(
           """
-            INSERT INTO users (user_id, username, last_seen)
-            VALUES (?, ?, ?)
+            INSERT INTO users (user_id, username, last_seen, last_broadcast)
+            VALUES (?, ?, ?, NULL)
             ON CONFLICT(user_id) DO UPDATE SET
                 username = COALESCE(excluded.username, users.username),
                 last_seen = excluded.last_seen
         """,
           (user.id, user.username, now_iso),
       )
+      conn.commit()
+
+
+async def save_last_broadcast_db(user_id: int, dt: datetime.datetime):
+  LAST_BROADCAST[user_id] = dt
+  iso_str = dt.isoformat()
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          """
+            INSERT INTO users (user_id, username, last_seen, last_broadcast)
+            VALUES ($1, NULL, $2, $2)
+            ON CONFLICT (user_id) DO UPDATE
+            SET last_broadcast = EXCLUDED.last_broadcast
+        """,
+          user_id,
+          iso_str,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          """
+            INSERT INTO users (user_id, username, last_seen, last_broadcast)
+            VALUES (?, NULL, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                last_broadcast = excluded.last_broadcast
+        """,
+          (user_id, iso_str, iso_str),
+      )
+      conn.commit()
+
+
+async def save_abandoned_reminder_db(user_id: int, remind_at: datetime.datetime):
+  iso_str = remind_at.isoformat()
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          """
+            INSERT INTO abandoned_reminders (user_id, remind_at)
+            VALUES ($1, $2)
+            ON CONFLICT (user_id) DO UPDATE SET remind_at = EXCLUDED.remind_at
+        """,
+          user_id,
+          iso_str,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          """
+            INSERT INTO abandoned_reminders (user_id, remind_at)
+            VALUES (?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET remind_at = excluded.remind_at
+        """,
+          (user_id, iso_str),
+      )
+      conn.commit()
+
+
+async def delete_abandoned_reminder_db(user_id: int):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute("DELETE FROM abandoned_reminders WHERE user_id = $1", user_id)
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM abandoned_reminders WHERE user_id = ?", (user_id,))
       conn.commit()
 
 
@@ -365,6 +495,30 @@ async def add_order_to_db(
     )
     conn.commit()
     return cursor.lastrowid
+
+
+async def set_user_orders_in_work_db(user_id: int) -> int:
+  new_status = "⚙️ В работе"
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      result = await conn.execute(
+          "UPDATE orders SET status = $1 WHERE user_id = $2",
+          new_status,
+          user_id,
+      )
+      try:
+        return int(result.split()[-1])
+      except Exception:
+        return 0
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      cursor = conn.cursor()
+      cursor.execute(
+          "UPDATE orders SET status = ? WHERE user_id = ?",
+          (new_status, user_id),
+      )
+      conn.commit()
+      return cursor.rowcount
 
 
 async def get_user_orders_from_db(user_id: int):
@@ -412,15 +566,27 @@ async def get_user_orders_from_db(user_id: int):
     ]
 
 
-async def is_user_banned(user_id: int) -> bool:
+async def is_user_banned(user_id: int, username: str | None = None) -> bool:
+  target_ids = {user_id}
+  if username:
+    mapped_id = USER_MAPPING.get(username.lower().lstrip("@"))
+    if mapped_id:
+      target_ids.add(int(mapped_id))
+
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
-      row = await conn.fetchrow("SELECT 1 FROM banned_users WHERE user_id = $1", user_id)
-      return row is not None
+      for tid in target_ids:
+        row = await conn.fetchrow("SELECT 1 FROM banned_users WHERE user_id = $1", tid)
+        if row is not None:
+          return True
+      return False
   with sqlite3.connect("bot_database.db") as conn:
     cursor = conn.cursor()
-    cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
-    return cursor.fetchone() is not None
+    for tid in target_ids:
+      cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (tid,))
+      if cursor.fetchone() is not None:
+        return True
+    return False
 
 
 async def ban_user_in_db(user_id: int):
@@ -430,6 +596,16 @@ async def ban_user_in_db(user_id: int):
   else:
     with sqlite3.connect("bot_database.db") as conn:
       conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
+      conn.commit()
+
+
+async def unban_user_in_db(user_id: int):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute("DELETE FROM banned_users WHERE user_id = $1", user_id)
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM banned_users WHERE user_id = ?", (user_id,))
       conn.commit()
 
 
@@ -571,11 +747,26 @@ async def sync_card_details_db():
 
 
 # === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
+def is_admin_authorized(user_id: int) -> bool:
+  return bool(ADMIN_ID) and user_id == ADMIN_ID
+
+
 def is_manager_authorized(user_id: int) -> bool:
   allowed_ids = {uid for uid in (MANAGER_ID, ADMIN_ID) if uid}
   if not allowed_ids:
-    return True
+    return False
   return user_id in allowed_ids
+
+
+def _resolve_user_target(raw: str) -> int | None:
+  cleaned = raw.strip()
+  if not cleaned:
+    return None
+  if cleaned.isdigit():
+    return int(cleaned)
+  uname_key = cleaned.lstrip("@").lower()
+  mapped = USER_MAPPING.get(uname_key)
+  return int(mapped) if mapped else None
 
 
 def _format_price(amount: float | int) -> str:
@@ -645,15 +836,17 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
 # === MIDDLEWARE ДЛЯ ПРОВЕРКИ БАНА ===
 @router.message.middleware()
 async def ban_middleware(handler, event, data):
-  if event.from_user and await is_user_banned(event.from_user.id):
-    return
+  if event.from_user:
+    if is_admin_authorized(event.from_user.id) and event.text and event.text.strip().startswith("/unban"):
+      return await handler(event, data)
+    if await is_user_banned(event.from_user.id, event.from_user.username):
+      return
   return await handler(event, data)
 
 
 @router.callback_query.middleware()
 async def ban_callback_middleware(handler, event, data):
-  if event.from_user and await is_user_banned(event.from_user.id):
-    await event.answer("❌ Вы заблокированы в этом боте.", show_alert=True)
+  if event.from_user and await is_user_banned(event.from_user.id, event.from_user.username):
     return
   return await handler(event, data)
 
@@ -1036,16 +1229,55 @@ async def cmd_manager_send(message: Message):
     await message.reply(f"❌ Ошибка отправки пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
 
 
+@router.message(Command("work"))
+async def cmd_manager_work(message: Message):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
+    await message.reply(
+        "❌ Использование: `/work <user_id или @username>`\nПример: `/work 4324324`",
+        parse_mode="Markdown",
+    )
+    return
+
+  target_user_id = _resolve_user_target(args[1])
+  if not target_user_id:
+    await message.reply("❌ Пользователь не найден.")
+    return
+
+  updated_count = await set_user_orders_in_work_db(target_user_id)
+  if updated_count <= 0:
+    await message.reply(
+        f"❌ У пользователя <code>{target_user_id}</code> не найдено заказов для перевода в статус «В работе».",
+        parse_mode="HTML",
+    )
+    return
+
+  try:
+    await message.bot.send_message(
+        chat_id=target_user_id,
+        text="⚙️ <b>Статус вашего заказа обновлен: В работе.</b>",
+        parse_mode="HTML",
+    )
+  except Exception as e:
+    logger.warning(f"Не удалось уведомить пользователя {target_user_id} о статусе заказа: {e}")
+
+  await message.reply(
+      f"✅ Статус заказа(ов) пользователя <code>{target_user_id}</code> переведен в <b>В работе</b> (обновлено записей: {updated_count}).",
+      parse_mode="HTML",
+  )
+
+
 @router.message(Command("ban"))
 async def cmd_ban_user(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply("❌ Использование: `/ban <user_id или @username>`", parse_mode="Markdown")
     return
-  target = args[1].strip()
-  target_user_id = int(target) if target.isdigit() else USER_MAPPING.get(target.lstrip("@").lower())
+  target_user_id = _resolve_user_target(args[1])
   if target_user_id:
     await ban_user_in_db(target_user_id)
     await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> заблокирован.", parse_mode="HTML")
@@ -1053,9 +1285,25 @@ async def cmd_ban_user(message: Message):
     await message.reply("❌ Пользователь не найден.")
 
 
+@router.message(Command("unban"))
+async def cmd_unban_user(message: Message):
+  if not is_admin_authorized(message.from_user.id):
+    return
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
+    await message.reply("❌ Использование: `/unban <user_id или @username>`", parse_mode="Markdown")
+    return
+  target_user_id = _resolve_user_target(args[1])
+  if target_user_id:
+    await unban_user_in_db(target_user_id)
+    await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> разблокирован.", parse_mode="HTML")
+  else:
+    await message.reply("❌ Пользователь не найден.")
+
+
 @router.message(Command("ans"))
 async def cmd_admin_answer(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   args = message.text.split(maxsplit=2)
   if len(args) < 3:
@@ -1080,6 +1328,8 @@ async def cmd_admin_answer(message: Message):
 
 @router.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
 async def admin_reply_handler(message: Message):
+  if not is_admin_authorized(message.from_user.id):
+    return
   reply_msg = message.reply_to_message
   text_to_parse = (reply_msg.text or "") + (reply_msg.caption or "")
 
@@ -1106,7 +1356,7 @@ async def admin_reply_handler(message: Message):
 
 @router.message(Command("clear_cache"))
 async def cmd_clear_cache(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   BANNER_CACHE.clear()
   await message.reply("✅ Кеш баннеров успешно очищен.")
@@ -1131,7 +1381,7 @@ def _is_crypto_asset_and_network(asset: str, network: str) -> bool:
 
 @router.message(Command("add"))
 async def cmd_add_requisites(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
@@ -1182,7 +1432,7 @@ async def cmd_add_requisites(message: Message):
 
 @router.message(Command("delete"))
 async def cmd_delete_requisites(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   global CARD_DETAILS, CRYPTO_WALLETS
   args = message.text.split(maxsplit=1)
@@ -1231,7 +1481,7 @@ async def cmd_delete_requisites(message: Message):
 
 @router.message(Command("freeze"))
 async def cmd_freeze_requisites(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
@@ -1280,7 +1530,7 @@ async def cmd_freeze_requisites(message: Message):
 
 @router.message(Command("list"))
 async def cmd_list_requisites(message: Message):
-  if ADMIN_ID and message.from_user.id != ADMIN_ID:
+  if not is_admin_authorized(message.from_user.id):
     return
 
   now = datetime.datetime.now()
@@ -1413,9 +1663,10 @@ async def scheduled_broadcast(bot: Bot):
     now = datetime.datetime.now()
     banner_path = get_banner_path("special_offer.jpg")
     for user_id, last_time in list(KNOWN_USERS.items()):
-      if await is_user_banned(user_id):
+      if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
         continue
-      if last_time is None or (now - last_time).total_seconds() >= 24 * 3600:
+      ref_time = LAST_BROADCAST.get(user_id) or last_time
+      if ref_time is None or (now - ref_time).total_seconds() >= 24 * 3600:
         try:
           today = datetime.date.today()
           target_date = today + datetime.timedelta(days=3)
@@ -1457,15 +1708,18 @@ async def scheduled_broadcast(bot: Bot):
           else:
             await bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard, parse_mode="HTML")
 
-          KNOWN_USERS[user_id] = now
+          await save_last_broadcast_db(user_id, now)
         except Exception as e:
           logger.error(f"Ошибка рассылки: {e}")
 
 
-async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
+async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int, delay_seconds: float = 1800.0):
   try:
-    await asyncio.sleep(1800)
-    if await is_user_banned(user_id):
+    if delay_seconds > 0:
+      await asyncio.sleep(delay_seconds)
+    if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+      ABANDONED_CHECKOUTS.pop(user_id, None)
+      await delete_abandoned_reminder_db(user_id)
       return
     if user_id in ABANDONED_CHECKOUTS:
       reminder_text = (
@@ -1493,6 +1747,7 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
         await bot.send_message(chat_id=user_id, text=reminder_text, reply_markup=keyboard, parse_mode="HTML")
 
       ABANDONED_CHECKOUTS.pop(user_id, None)
+      await delete_abandoned_reminder_db(user_id)
   except asyncio.CancelledError:
     pass
 
@@ -1570,6 +1825,7 @@ async def back_home(callback: CallbackQuery, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user_id, None)
   if task:
     task.cancel()
+  await delete_abandoned_reminder_db(user_id)
   await show_main_menu(callback, state)
 
 
@@ -1702,6 +1958,7 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user_id, None)
   if task:
     task.cancel()
+  await delete_abandoned_reminder_db(user_id)
 
   await state.set_state(OrderForm.service)
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
@@ -1832,7 +2089,11 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
     task = ABANDONED_CHECKOUTS.pop(user_id, None)
     if task:
       task.cancel()
-  ABANDONED_CHECKOUTS[user_id] = asyncio.create_task(delayed_abandoned_cart_reminder(callback.bot, user_id))
+  remind_at = datetime.datetime.now() + datetime.timedelta(seconds=1800)
+  await save_abandoned_reminder_db(user_id, remind_at)
+  ABANDONED_CHECKOUTS[user_id] = asyncio.create_task(
+      delayed_abandoned_cart_reminder(callback.bot, user_id, delay_seconds=1800.0)
+  )
 
   payment_text = (
       "⏳ <b>Оплата заказа</b>\n"
@@ -1947,6 +2208,7 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
+  await delete_abandoned_reminder_db(user.id)
 
   ctx = await _get_payment_context(user.id, state)
   service_name = ctx["service_name"]
@@ -2062,6 +2324,7 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
+  await delete_abandoned_reminder_db(user.id)
 
   ctx = await _get_payment_context(user.id, state)
   service_name = ctx["service_name"]
@@ -2109,6 +2372,7 @@ async def process_receipt_document(message: Message, state: FSMContext):
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
+  await delete_abandoned_reminder_db(user.id)
 
   service_name = ctx["service_name"]
   total_price = ctx["total_price"]
@@ -2186,8 +2450,8 @@ async def start_web_server():
 
 async def main():
   await init_db()
-  await load_persistent_state()
   bot = Bot(token=BOT_TOKEN)
+  await load_persistent_state(bot=bot)
   dp = Dispatcher()
   dp.include_router(router)
 
