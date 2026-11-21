@@ -12,18 +12,24 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
-    FSInputFile,
     InputMediaPhoto,
+    Message,
 )
 from aiohttp import ClientSession, web
 from dotenv import load_dotenv
 
+try:
+  import asyncpg
+except ImportError:
+  asyncpg = None
+
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CRYPTO_BOT_TOKEN = os.getenv("CRYPTO_BOT_TOKEN")
+DATABASE_URL = os.getenv("DATABASE_URL")
 ADMIN_ID_env = os.getenv("ADMIN_ID")
 ADMIN_ID = int(ADMIN_ID_env) if ADMIN_ID_env and ADMIN_ID_env.isdigit() else 0
 MANAGER_ID_env = os.getenv("MANAGER_ID")
@@ -35,9 +41,37 @@ if not BOT_TOKEN:
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+PG_POOL = None
 
-# === ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ SQLite ===
-def init_db():
+
+class OrderForm(StatesGroup):
+  service = State()
+  target_username = State()
+  special_link = State()
+  receipt = State()
+
+
+class SupportForm(StatesGroup):
+  reason = State()
+  photo = State()
+
+
+# Словари и кэши в памяти (синхронизируются с БД)
+KNOWN_USERS = {}
+USER_MAPPING = {}
+ABANDONED_CHECKOUTS = {}
+CARD_DETAILS = []
+CARD_POINTERS = {}
+CRYPTO_WALLETS = []
+CRYPTO_POINTERS = {}
+BANNER_CACHE = {}
+PENDING_BILLS = {}
+
+router = Router()
+
+
+# === ИНИЦИАЛИЗАЦИЯ БД (PostgreSQL с fallback на SQLite) ===
+def _init_sqlite_db():
   with sqlite3.connect("bot_database.db") as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -60,15 +94,268 @@ def init_db():
           )
       """
     )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS users (
+              user_id BIGINT PRIMARY KEY,
+              username TEXT,
+              last_seen TEXT
+          )
+      """
+    )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS card_details (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              details TEXT,
+              bank TEXT,
+              country TEXT,
+              frozen_until TEXT
+          )
+      """
+    )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS crypto_wallets (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              address TEXT,
+              asset TEXT,
+              network TEXT,
+              frozen_until TEXT
+          )
+      """
+    )
+    cursor.execute(
+        """
+          CREATE TABLE IF NOT EXISTS pending_bills (
+              user_id BIGINT PRIMARY KEY,
+              service_name TEXT,
+              total_price REAL,
+              target_username TEXT
+          )
+      """
+    )
     conn.commit()
 
 
-def add_order_to_db(
+async def init_db():
+  global PG_POOL
+  _init_sqlite_db()
+  if DATABASE_URL and asyncpg:
+    try:
+      PG_POOL = await asyncpg.create_pool(dsn=DATABASE_URL, min_size=1, max_size=5)
+      async with PG_POOL.acquire() as conn:
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS orders (
+                  id SERIAL PRIMARY KEY,
+                  user_id BIGINT,
+                  service_name TEXT,
+                  total_price DOUBLE PRECISION,
+                  status TEXT,
+                  created_at TEXT,
+                  target_info TEXT
+              )
+          """
+        )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS banned_users (
+                  user_id BIGINT PRIMARY KEY
+              )
+          """
+        )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS users (
+                  user_id BIGINT PRIMARY KEY,
+                  username TEXT,
+                  last_seen TEXT
+              )
+          """
+        )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS card_details (
+                  id SERIAL PRIMARY KEY,
+                  details TEXT,
+                  bank TEXT,
+                  country TEXT,
+                  frozen_until TEXT
+              )
+          """
+        )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS crypto_wallets (
+                  id SERIAL PRIMARY KEY,
+                  address TEXT,
+                  asset TEXT,
+                  network TEXT,
+                  frozen_until TEXT
+              )
+          """
+        )
+        await conn.execute(
+            """
+              CREATE TABLE IF NOT EXISTS pending_bills (
+                  user_id BIGINT PRIMARY KEY,
+                  service_name TEXT,
+                  total_price DOUBLE PRECISION,
+                  target_username TEXT
+              )
+          """
+        )
+      logger.info("✅ PostgreSQL подключена и таблицы инициализированы.")
+    except Exception as e:
+      logger.error(f"❌ Ошибка подключения к PostgreSQL, используется SQLite: {e}")
+      PG_POOL = None
+
+
+async def load_persistent_state():
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      u_rows = await conn.fetch("SELECT user_id, username, last_seen FROM users")
+      for r in u_rows:
+        uid = int(r["user_id"])
+        USER_MAPPING[uid] = r["username"]
+        if r["username"]:
+          USER_MAPPING[r["username"].lower().lstrip("@")] = uid
+        if r["last_seen"]:
+          try:
+            KNOWN_USERS[uid] = datetime.datetime.fromisoformat(r["last_seen"])
+          except Exception:
+            KNOWN_USERS[uid] = datetime.datetime.now()
+
+      c_rows = await conn.fetch("SELECT details, bank, country, frozen_until FROM card_details")
+      CARD_DETAILS.clear()
+      for r in c_rows:
+        CARD_DETAILS.append({
+            "details": r["details"],
+            "bank": r["bank"],
+            "country": r["country"],
+            "frozen_until": datetime.datetime.fromisoformat(r["frozen_until"]) if r["frozen_until"] else None,
+        })
+
+      w_rows = await conn.fetch("SELECT address, asset, network, frozen_until FROM crypto_wallets")
+      CRYPTO_WALLETS.clear()
+      for r in w_rows:
+        CRYPTO_WALLETS.append({
+            "address": r["address"],
+            "asset": r["asset"],
+            "network": r["network"],
+            "frozen_until": datetime.datetime.fromisoformat(r["frozen_until"]) if r["frozen_until"] else None,
+        })
+
+      b_rows = await conn.fetch("SELECT user_id, service_name, total_price, target_username FROM pending_bills")
+      PENDING_BILLS.clear()
+      for r in b_rows:
+        PENDING_BILLS[int(r["user_id"])] = {
+            "service_name": r["service_name"],
+            "total_price": float(r["total_price"]),
+            "target_username": r["target_username"],
+        }
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      cursor = conn.cursor()
+      for uid, uname, last_seen in cursor.execute("SELECT user_id, username, last_seen FROM users").fetchall():
+        USER_MAPPING[uid] = uname
+        if uname:
+          USER_MAPPING[uname.lower().lstrip("@")] = uid
+        if last_seen:
+          try:
+            KNOWN_USERS[uid] = datetime.datetime.fromisoformat(last_seen)
+          except Exception:
+            KNOWN_USERS[uid] = datetime.datetime.now()
+
+      CARD_DETAILS.clear()
+      for details, bank, country, frozen_until in cursor.execute(
+          "SELECT details, bank, country, frozen_until FROM card_details"
+      ).fetchall():
+        CARD_DETAILS.append({
+            "details": details,
+            "bank": bank,
+            "country": country,
+            "frozen_until": datetime.datetime.fromisoformat(frozen_until) if frozen_until else None,
+        })
+
+      CRYPTO_WALLETS.clear()
+      for address, asset, network, frozen_until in cursor.execute(
+          "SELECT address, asset, network, frozen_until FROM crypto_wallets"
+      ).fetchall():
+        CRYPTO_WALLETS.append({
+            "address": address,
+            "asset": asset,
+            "network": network,
+            "frozen_until": datetime.datetime.fromisoformat(frozen_until) if frozen_until else None,
+        })
+
+      PENDING_BILLS.clear()
+      for uid, sname, price, tuser in cursor.execute(
+          "SELECT user_id, service_name, total_price, target_username FROM pending_bills"
+      ).fetchall():
+        PENDING_BILLS[uid] = {
+            "service_name": sname,
+            "total_price": float(price),
+            "target_username": tuser,
+        }
+
+
+async def save_user_to_db(user):
+  if not user:
+    return
+  now_iso = datetime.datetime.now().isoformat()
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          """
+            INSERT INTO users (user_id, username, last_seen)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (user_id) DO UPDATE
+            SET username = COALESCE(EXCLUDED.username, users.username),
+                last_seen = EXCLUDED.last_seen
+        """,
+          user.id,
+          user.username,
+          now_iso,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          """
+            INSERT INTO users (user_id, username, last_seen)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = COALESCE(excluded.username, users.username),
+                last_seen = excluded.last_seen
+        """,
+          (user.id, user.username, now_iso),
+      )
+      conn.commit()
+
+
+async def add_order_to_db(
     user_id: int, service_name: str, total_price: float, status: str, target_info: str
 ):
+  date_str = datetime.datetime.now().strftime("%d %B")
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      row = await conn.fetchrow(
+          """
+            INSERT INTO orders (user_id, service_name, total_price, status, created_at, target_info)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            RETURNING id
+        """,
+          user_id,
+          service_name,
+          total_price,
+          status,
+          date_str,
+          target_info,
+      )
+      return row["id"] if row else None
   with sqlite3.connect("bot_database.db") as conn:
     cursor = conn.cursor()
-    date_str = datetime.datetime.now().strftime("%d %B")
     cursor.execute(
         """
           INSERT INTO orders (user_id, service_name, total_price, status, created_at, target_info)
@@ -80,7 +367,28 @@ def add_order_to_db(
     return cursor.lastrowid
 
 
-def get_user_orders_from_db(user_id: int):
+async def get_user_orders_from_db(user_id: int):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      rows = await conn.fetch(
+          """
+            SELECT id, service_name, total_price, status, created_at, target_info
+            FROM orders WHERE user_id = $1 ORDER BY id DESC
+        """,
+          user_id,
+      )
+      return [
+          {
+              "id": r["id"],
+              "service_name": r["service_name"],
+              "total_price": r["total_price"],
+              "status": r["status"],
+              "created_at": r["created_at"],
+              "target_info": r["target_info"],
+          }
+          for r in rows
+      ]
+
   with sqlite3.connect("bot_database.db") as conn:
     cursor = conn.cursor()
     cursor.execute(
@@ -91,60 +399,178 @@ def get_user_orders_from_db(user_id: int):
         (user_id,),
     )
     rows = cursor.fetchall()
-    orders = []
-    for row in rows:
-      orders.append(
-          {
-              "id": row[0],
-              "service_name": row[1],
-              "total_price": row[2],
-              "status": row[3],
-              "created_at": row[4],
-              "target_info": row[5],
-          }
-      )
-    return orders
+    return [
+        {
+            "id": row[0],
+            "service_name": row[1],
+            "total_price": row[2],
+            "status": row[3],
+            "created_at": row[4],
+            "target_info": row[5],
+        }
+        for row in rows
+    ]
 
 
-def is_user_banned(user_id: int) -> bool:
+async def is_user_banned(user_id: int) -> bool:
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      row = await conn.fetchrow("SELECT 1 FROM banned_users WHERE user_id = $1", user_id)
+      return row is not None
   with sqlite3.connect("bot_database.db") as conn:
     cursor = conn.cursor()
     cursor.execute("SELECT 1 FROM banned_users WHERE user_id = ?", (user_id,))
-    row = cursor.fetchone()
-    return row is not None
+    return cursor.fetchone() is not None
 
 
-def ban_user_in_db(user_id: int):
-  with sqlite3.connect("bot_database.db") as conn:
-    cursor = conn.cursor()
-    cursor.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
-    conn.commit()
+async def ban_user_in_db(user_id: int):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute("INSERT INTO banned_users (user_id) VALUES ($1) ON CONFLICT DO NOTHING", user_id)
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("INSERT OR IGNORE INTO banned_users (user_id) VALUES (?)", (user_id,))
+      conn.commit()
 
 
-class OrderForm(StatesGroup):
-  service = State()
-  target_username = State()
-  special_link = State()
-  receipt = State()
+async def save_pending_bill_db(user_id: int, bill: dict):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          """
+            INSERT INTO pending_bills (user_id, service_name, total_price, target_username)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET
+                service_name = EXCLUDED.service_name,
+                total_price = EXCLUDED.total_price,
+                target_username = EXCLUDED.target_username
+        """,
+          user_id,
+          bill["service_name"],
+          bill["total_price"],
+          bill["target_username"],
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          """
+            INSERT INTO pending_bills (user_id, service_name, total_price, target_username)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                service_name = excluded.service_name,
+                total_price = excluded.total_price,
+                target_username = excluded.target_username
+        """,
+          (user_id, bill["service_name"], bill["total_price"], bill["target_username"]),
+      )
+      conn.commit()
 
 
-class SupportForm(StatesGroup):
-  reason = State()
-  photo = State()
+async def delete_pending_bill_db(user_id: int):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute("DELETE FROM pending_bills WHERE user_id = $1", user_id)
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM pending_bills WHERE user_id = ?", (user_id,))
+      conn.commit()
 
 
-# Словари и базы в памяти для отслеживания активности и реквизитов
-KNOWN_USERS = {}
-USER_MAPPING = {}      # Кэш для связи username <-> user_id для команды /ban
-ABANDONED_CHECKOUTS = {}
-CARD_DETAILS = []      # Список реквизитов карт/телефонов
-CARD_POINTERS = {}     # Индексы для циклического чередования реквизитов по странам
-BANNER_CACHE = {}      # Кэш file_id баннеров для мгновенной загрузки
-PENDING_BILLS = {}     # Выставленные менеджером счета по user_id
+async def add_card_db(details: str, bank: str, country: str):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          "INSERT INTO card_details (details, bank, country, frozen_until) VALUES ($1, $2, $3, NULL)",
+          details,
+          bank,
+          country,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          "INSERT INTO card_details (details, bank, country, frozen_until) VALUES (?, ?, ?, NULL)",
+          (details, bank, country),
+      )
+      conn.commit()
 
-router = Router()
+
+async def add_crypto_wallet_db(address: str, asset: str, network: str):
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          "INSERT INTO crypto_wallets (address, asset, network, frozen_until) VALUES ($1, $2, $3, NULL)",
+          address,
+          asset,
+          network,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          "INSERT INTO crypto_wallets (address, asset, network, frozen_until) VALUES (?, ?, ?, NULL)",
+          (address, asset, network),
+      )
+      conn.commit()
 
 
+async def sync_crypto_wallets_db():
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      async with conn.transaction():
+        await conn.execute("DELETE FROM crypto_wallets")
+        for w in CRYPTO_WALLETS:
+          await conn.execute(
+              "INSERT INTO crypto_wallets (address, asset, network, frozen_until) VALUES ($1, $2, $3, $4)",
+              w["address"],
+              w["asset"],
+              w["network"],
+              w["frozen_until"].isoformat() if w["frozen_until"] else None,
+          )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM crypto_wallets")
+      for w in CRYPTO_WALLETS:
+        conn.execute(
+            "INSERT INTO crypto_wallets (address, asset, network, frozen_until) VALUES (?, ?, ?, ?)",
+            (
+                w["address"],
+                w["asset"],
+                w["network"],
+                w["frozen_until"].isoformat() if w["frozen_until"] else None,
+            ),
+        )
+      conn.commit()
+
+
+async def sync_card_details_db():
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      async with conn.transaction():
+        await conn.execute("DELETE FROM card_details")
+        for c in CARD_DETAILS:
+          await conn.execute(
+              "INSERT INTO card_details (details, bank, country, frozen_until) VALUES ($1, $2, $3, $4)",
+              c["details"],
+              c["bank"],
+              c["country"],
+              c["frozen_until"].isoformat() if c["frozen_until"] else None,
+          )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM card_details")
+      for c in CARD_DETAILS:
+        conn.execute(
+            "INSERT INTO card_details (details, bank, country, frozen_until) VALUES (?, ?, ?, ?)",
+            (
+                c["details"],
+                c["bank"],
+                c["country"],
+                c["frozen_until"].isoformat() if c["frozen_until"] else None,
+            ),
+        )
+      conn.commit()
+
+
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ===
 def is_manager_authorized(user_id: int) -> bool:
   allowed_ids = {uid for uid in (MANAGER_ID, ADMIN_ID) if uid}
   if not allowed_ids:
@@ -161,14 +587,16 @@ def _format_price(amount: float | int) -> str:
 def _build_catalog_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="💣 Снос Telegram аккаунта — 15$", callback_data="srv_Снос_Telegram_аккаунта_15", style="danger")],
           [InlineKeyboardButton(text="🔍 Доксинг — 30$", callback_data="srv_Доксинг_30", style="primary")],
-          [InlineKeyboardButton(text="⚡️ DDos-атака сайта — 60$", callback_data="srv_DDos-атака_сайта_60", style="danger")],
-          [InlineKeyboardButton(text="📸 Взлом Instagram — 90$", callback_data="srv_Взлом_Instagram_90", style="primary")],
+          [InlineKeyboardButton(text="💣 Снос Telegram аккаунта — 50$", callback_data="srv_Снос_Telegram_аккаунта_50", style="danger")],
+          [InlineKeyboardButton(text="⚡️ DDos-атака сайта — 70$", callback_data="srv_DDos-атака_сайта_70", style="danger")],
+          [InlineKeyboardButton(text="📸 Взлом Instagram — 100$", callback_data="srv_Взлом_Instagram_100", style="primary")],
           [InlineKeyboardButton(text="💬 Взлом Telegram аккаунта — 120$", callback_data="srv_Взлом_Telegram_аккаунта_120", style="danger")],
-          [InlineKeyboardButton(text="💣 Снос TG канала или бота — 180$", callback_data="srv_Снос_TG_канала_или_бота_180", style="primary")],
-          [InlineKeyboardButton(text="🌐 Снос сайта — 250$", callback_data="srv_Снос_сайта_250", style="danger")],
+          [InlineKeyboardButton(text="🪪 Слив базы сайта — 160$", callback_data="srv_Слив_базы_сайта_160", style="danger")],
+          [InlineKeyboardButton(text="💣 Снос TG канала или бота — 200$", callback_data="srv_Снос_TG_канала_или_бота_200", style="primary")],
+          [InlineKeyboardButton(text="🌐 Снос сайта — 300$", callback_data="srv_Снос_сайта_300", style="danger")],
           [InlineKeyboardButton(text="🛠 Особый заказ — Рассчитать стоимость", callback_data="srv_special_order", style="primary")],
+          [InlineKeyboardButton(text="📖 О услугах", url="https://telegra.ph/Podrobnyj-gajd-po-uslugam-i-oformleniyu-zakaza-11-20-2")],
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")],
       ]
   )
@@ -202,16 +630,12 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
           ],
           [
               InlineKeyboardButton(text="💳 Суммы (UZS)", callback_data="pay_currency_UZS", style="primary"),
-              InlineKeyboardButton(text="💳 Леи (MLD)", callback_data="pay_currency_MDL", style="danger"),
+              InlineKeyboardButton(text="💳 Леи (MDL)", callback_data="pay_currency_MDL", style="danger"),
           ],
-          [
-              InlineKeyboardButton(text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary"),
-              InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger"),
-          ],
-          [
-              InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary"),
-              InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger"),
-          ]
+          [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
+          [InlineKeyboardButton(text="🪙 Реквизиты (Крипта)", callback_data="crypto_expert", style="danger")],
+          [InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")],
       ]
   )
 
@@ -219,27 +643,28 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
 # === MIDDLEWARE ДЛЯ ПРОВЕРКИ БАНА ===
 @router.message.middleware()
 async def ban_middleware(handler, event, data):
-  if event.from_user and is_user_banned(event.from_user.id):
+  if event.from_user and await is_user_banned(event.from_user.id):
     return
   return await handler(event, data)
 
 
 @router.callback_query.middleware()
 async def ban_callback_middleware(handler, event, data):
-  if event.from_user and is_user_banned(event.from_user.id):
+  if event.from_user and await is_user_banned(event.from_user.id):
     await event.answer("❌ Вы заблокированы в этом боте.", show_alert=True)
     return
   return await handler(event, data)
 
 
-def track_user(user):
+async def track_user(user):
   if user:
     USER_MAPPING[user.id] = user.username
     if user.username:
-      USER_MAPPING[user.username.lower().lstrip('@')] = user.id
+      USER_MAPPING[user.username.lower().lstrip("@")] = user.id
+    await save_user_to_db(user)
 
 
-# === СЛОВАРЬ ВАЛЮТ ДЛЯ СТРАН ===
+# === ВАЛЮТЫ ДЛЯ ОПЛАТЫ КАРТОЙ / СБП / НА НОМЕР ===
 CURRENCY_CONFIG = {
     "RUB": {"country": "Россия", "name": "Рубли (RUB)", "symbol": "₽"},
     "BYN": {"country": "Беларусь", "name": "BYN", "symbol": "BYN"},
@@ -249,32 +674,35 @@ CURRENCY_CONFIG = {
     "MDL": {"country": "Молдова", "name": "Мд. леях (MDL)", "symbol": "лей"},
 }
 
-# === КРИПТОСЕТИ И РЕКВИЗИТЫ ===
+# === КРИПТОСЕТИ ===
 CRYPTO_NETWORKS = {
     "trc20": {
         "name": "USDT (TRC-20)",
-        "address": "TYd1ekJgTHnFfgAVYXsi7689GaG5oZN3Xe",
+        "asset": "USDT",
         "network": "TRC-20",
     },
     "bep20": {
         "name": "USDT (BEP-20)",
-        "address": "0x0A6C6634f8FD920a5E9E0d241CD46d6C15377f39",
+        "asset": "USDT",
         "network": "BEP-20",
     },
     "ton": {
-        "name": "TON",
-        "address": "UQDwk7PZoWr0zHv-BItBEGxnq4uyj81z6BlIw74heDgF-Shd",
+        "name": "USDT (TON)",
+        "asset": "USDT",
         "network": "TON",
     },
     "btc": {
         "name": "Bitcoin (BTC)",
-        "address": "bc1qj7xy0645vcza7l3et5s8nuahllua9a439c0795",
+        "asset": "BTC",
         "network": "Bitcoin",
     },
 }
 
 
-# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ДЛЯ КАРТ И ЧЕРЕДОВАНИЯ (ROUND-ROBIN) ===
+def _normalize_network(net_str: str) -> str:
+  return re.sub(r"[^a-z0-9]", "", net_str.lower())
+
+
 def get_next_card(country: str):
   now = datetime.datetime.now()
   active = []
@@ -282,21 +710,52 @@ def get_next_card(country: str):
     if card["country"].lower() == country.lower():
       if card["frozen_until"] and card["frozen_until"] > now:
         continue
-      elif card["frozen_until"] and card["frozen_until"] <= now:
+      if card["frozen_until"] and card["frozen_until"] <= now:
         card["frozen_until"] = None
       active.append(card)
-
   if not active:
     return None
-
   if country not in CARD_POINTERS:
     CARD_POINTERS[country] = 0
-
   index = CARD_POINTERS[country] % len(active)
   chosen_card = active[index]
   CARD_POINTERS[country] = (index + 1) % len(active)
-
   return chosen_card
+
+
+def _find_matching_wallets(net_key: str):
+  net_info = CRYPTO_NETWORKS.get(net_key)
+  if not net_info:
+    return []
+  target_net = _normalize_network(net_info["network"])
+  target_asset = net_info["asset"].upper()
+  now = datetime.datetime.now()
+  active = []
+  for wallet in CRYPTO_WALLETS:
+    w_net = _normalize_network(wallet["network"])
+    w_asset = wallet["asset"].upper()
+    matched = (w_net == target_net and w_asset == target_asset) or (
+        net_key == "ton" and w_net == "ton" and w_asset == "USDT"
+    )
+    if matched:
+      if wallet["frozen_until"] and wallet["frozen_until"] > now:
+        continue
+      if wallet["frozen_until"] and wallet["frozen_until"] <= now:
+        wallet["frozen_until"] = None
+      active.append(wallet)
+  return active
+
+
+def get_next_crypto_wallet(net_key: str):
+  active = _find_matching_wallets(net_key)
+  if not active:
+    return None
+  if net_key not in CRYPTO_POINTERS:
+    CRYPTO_POINTERS[net_key] = 0
+  index = CRYPTO_POINTERS[net_key] % len(active)
+  chosen = active[index]
+  CRYPTO_POINTERS[net_key] = (index + 1) % len(active)
+  return chosen
 
 
 async def get_exchange_rate(target_currency: str) -> float:
@@ -313,7 +772,12 @@ async def get_exchange_rate(target_currency: str) -> float:
     logger.warning(f"Не удалось получить курс для {target_currency}: {e}")
 
   fallback_rates = {
-      "RUB": 95.0, "BYN": 3.3, "KZT": 480.0, "UAH": 41.5, "UZS": 12500.0, "MDL": 18.0,
+      "RUB": 95.0,
+      "BYN": 3.3,
+      "KZT": 480.0,
+      "UAH": 41.5,
+      "UZS": 12500.0,
+      "MDL": 18.0,
   }
   return fallback_rates.get(target_currency, 1.0)
 
@@ -341,17 +805,23 @@ def get_banner_path(banner_name: str):
   return None
 
 
-# === 100% ЗАЩИЩЕННАЯ И НАДЕЖНАЯ ФУНКЦИЯ РЕНДЕРИНГА (УСТРАНЕНИЕ ЛЮБЫХ ЗАВИСАНИЙ) ===
-async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_name: str, text: str, reply_markup: InlineKeyboardMarkup):
+# === РЕНДЕРИНГ ЭКРАНОВ ===
+async def render_step(
+    event: Message | CallbackQuery,
+    state: FSMContext,
+    banner_name: str,
+    text: str,
+    reply_markup: InlineKeyboardMarkup,
+):
   bot = event.bot
   chat_id = event.chat.id if isinstance(event, Message) else event.message.chat.id
-  
+
   data = await state.get_data()
   bot_msg_id = data.get("bot_msg_id")
 
   photo_source = None
   banner_path = get_banner_path(banner_name)
-  
+
   if banner_name in BANNER_CACHE:
     photo_source = BANNER_CACHE[banner_name]
   elif banner_path and os.path.exists(banner_path):
@@ -368,7 +838,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
         try:
           sent_msg = await msg.edit_media(
               media=InputMediaPhoto(media=photo_source, caption=text, parse_mode="HTML"),
-              reply_markup=reply_markup
+              reply_markup=reply_markup,
           )
           if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
             BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
@@ -392,10 +862,11 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
     except Exception:
       pass
 
-    # Безопасный Fallback для Callback
     try:
       if photo_source:
-        new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+        new_msg = await bot.send_photo(
+            chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML"
+        )
         if banner_name not in BANNER_CACHE and new_msg.photo:
           BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
       else:
@@ -404,7 +875,6 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
     except Exception as e:
       logger.error(f"Ошибка отправки в render_step (callback fallback): {e}")
   else:
-    # Удаляем сообщение пользователя, чтобы чат был чистым
     try:
       await event.delete()
     except Exception:
@@ -418,7 +888,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
               chat_id=chat_id,
               message_id=bot_msg_id,
               media=InputMediaPhoto(media=photo_source, caption=text, parse_mode="HTML"),
-              reply_markup=reply_markup
+              reply_markup=reply_markup,
           )
           if banner_name not in BANNER_CACHE and hasattr(sent_msg, "photo") and sent_msg.photo:
             BANNER_CACHE[banner_name] = sent_msg.photo[-1].file_id
@@ -429,17 +899,18 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
               message_id=bot_msg_id,
               text=text,
               reply_markup=reply_markup,
-              parse_mode="HTML"
+              parse_mode="HTML",
           )
           edited_successfully = True
       except Exception:
         pass
 
-    # ГАРАНТИРОВАННЫЙ FALLBACK: если редактирование не удалось, всегда отправляем новое сообщение пользователю
     if not edited_successfully:
       try:
         if photo_source:
-          new_msg = await bot.send_photo(chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML")
+          new_msg = await bot.send_photo(
+              chat_id=chat_id, photo=photo_source, caption=text, reply_markup=reply_markup, parse_mode="HTML"
+          )
           if banner_name not in BANNER_CACHE and new_msg.photo:
             BANNER_CACHE[banner_name] = new_msg.photo[-1].file_id
         else:
@@ -449,7 +920,7 @@ async def render_step(event: Message | CallbackQuery, state: FSMContext, banner_
         logger.error(f"Ошибка отправки нового сообщения в render_step (message fallback): {e}")
 
 
-# === ГЛАВНОЕ МЕНЮ (КИБЕР) С ИНВЕРТИРОВАННЫМИ ЦВЕТАМИ КНОПОК ===
+# === ГЛАВНОЕ МЕНЮ ===
 async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
   await state.clear()
   user_id = event.from_user.id
@@ -481,7 +952,10 @@ async def cmd_manager_bill(message: Message):
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
-    await message.reply("❌ Использование: `/bill <user_id> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
+    await message.reply(
+        "❌ Использование: `/bill <user_id> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`",
+        parse_mode="Markdown",
+    )
     return
 
   parts = args[1].strip().split()
@@ -501,18 +975,20 @@ async def cmd_manager_bill(message: Message):
   if not service_name:
     service_name = "Особый заказ"
 
-  PENDING_BILLS[target_user_id] = {
+  bill_obj = {
       "service_name": service_name,
       "total_price": amount,
       "target_username": "По счету менеджера",
   }
+  PENDING_BILLS[target_user_id] = bill_obj
+  await save_pending_bill_db(target_user_id, bill_obj)
 
   price_str = _format_price(amount)
   bill_text = (
       f"🧾 <b>Вам выставлен счет на {service_name}</b>\n\n"
       f"• Услуга: <b>{service_name}</b>\n"
-      f"• Сумма к оплате: <b>{price_str}$</b>\n\n"
-      f"Выберите страну / валюту или способ оплаты ниже, чтобы получить реквизиты:"
+      f"• К оплате: <b>{price_str} USDT</b>\n\n"
+      f"Выберите способ оплаты ниже, чтобы получить реквизиты:"
   )
   try:
     await message.bot.send_message(
@@ -522,7 +998,7 @@ async def cmd_manager_bill(message: Message):
         parse_mode="HTML",
     )
     await message.reply(
-        f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>.",
+        f"✅ Счет на <b>{service_name}</b> (<b>{price_str} USDT</b>) отправлен пользователю <code>{target_user_id}</code>.",
         parse_mode="HTML",
     )
   except Exception as e:
@@ -535,7 +1011,10 @@ async def cmd_manager_send(message: Message):
     return
   args = message.text.split(maxsplit=2)
   if len(args) < 3 or not args[1].strip().isdigit():
-    await message.reply("❌ Использование: `/send <user_id> <сообщение>`\nПример: `/send 282810030 Привет! Счет готов.`", parse_mode="Markdown")
+    await message.reply(
+        "❌ Использование: `/send <user_id> <сообщение>`\nПример: `/send 282810030 Привет! Счет готов.`",
+        parse_mode="Markdown",
+    )
     return
 
   target_user_id = int(args[1].strip())
@@ -566,7 +1045,7 @@ async def cmd_ban_user(message: Message):
   target = args[1].strip()
   target_user_id = int(target) if target.isdigit() else USER_MAPPING.get(target.lstrip("@").lower())
   if target_user_id:
-    ban_user_in_db(target_user_id)
+    await ban_user_in_db(target_user_id)
     await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> заблокирован.", parse_mode="HTML")
   else:
     await message.reply("❌ Пользователь не найден.")
@@ -590,7 +1069,7 @@ async def cmd_admin_answer(message: Message):
     await message.bot.send_message(
         chat_id=target_user_id,
         text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{reply_text}",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
     await message.reply(f"✅ Ответ успешно отправлен пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
   except Exception as e:
@@ -601,20 +1080,20 @@ async def cmd_admin_answer(message: Message):
 async def admin_reply_handler(message: Message):
   reply_msg = message.reply_to_message
   text_to_parse = (reply_msg.text or "") + (reply_msg.caption or "")
-  
+
   match = re.search(r"\(?<code>(\d+)<\/code>\)?", text_to_parse)
   if not match:
     match = re.search(r"ID:\s*(\d+)", text_to_parse)
   if not match:
     match = re.search(r"\b(\d{6,12})\b", text_to_parse)
-    
+
   if match:
     target_user_id = int(match.group(1))
     try:
       await message.bot.send_message(
           chat_id=target_user_id,
           text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{message.text}",
-          parse_mode="HTML"
+          parse_mode="HTML",
       )
       await message.reply(f"✅ Ответ отправлен пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
     except Exception as e:
@@ -631,72 +1110,167 @@ async def cmd_clear_cache(message: Message):
   await message.reply("✅ Кеш баннеров успешно очищен.")
 
 
+def _parse_wallet_args(raw: str):
+  parts = raw.strip().split()
+  if len(parts) < 3:
+    return None
+  address = parts[0]
+  asset = parts[1].upper()
+  network = " ".join(parts[2:])
+  return address, asset, network
+
+
+def _is_crypto_asset_and_network(asset: str, network: str) -> bool:
+  known_assets = {"USDT", "TON", "BTC", "BITCOIN", "ETH", "LTC"}
+  norm_net = _normalize_network(network)
+  known_nets = {"trc20", "bep20", "ton", "btc", "bitcoin", "erc20", "sol", "solana"}
+  return asset.upper() in known_assets or norm_net in known_nets
+
+
 @router.message(Command("add"))
-async def cmd_add_card(message: Message):
+async def cmd_add_requisites(message: Message):
   if ADMIN_ID and message.from_user.id != ADMIN_ID:
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
-    await message.reply("❌ Использование: `/add +783839293 ОзонБанк Россия`", parse_mode="Markdown")
+    await message.reply(
+        "❌ Использование:\n"
+        "• Крипта: `/add UQDwk7PZoWr0zHv-BItBEGxnq4uyj81z6BlIw74heDgF-Shd USDT TON`\n"
+        "• Крипта: `/add TYd1ekJgTHnFfgAVYXsi7689GaG5oZN3Xe USDT TRC-20`\n"
+        "• Карта/СБП: `/add +79990001122 ОзонБанк Россия`",
+        parse_mode="Markdown",
+    )
     return
-  parts = args[1].split()
-  if len(parts) < 3:
+
+  parsed = _parse_wallet_args(args[1])
+  if not parsed:
     await message.reply("❌ Неверный формат.")
     return
-  country = parts[-1]
-  bank = parts[-2]
-  details = " ".join(parts[:-2])
-  CARD_DETAILS.append({"details": details, "bank": bank, "country": country, "frozen_until": None})
-  await message.reply(f"✅ Реквизиты добавлены!\n🌍 {country} | 🏦 {bank}\n<code>{details}</code>", parse_mode="HTML")
+  first, second, rest = parsed
+
+  if _is_crypto_asset_and_network(second, rest):
+    CRYPTO_WALLETS.append({
+        "address": first,
+        "asset": second,
+        "network": rest,
+        "frozen_until": None,
+    })
+    await add_crypto_wallet_db(first, second, rest)
+    await message.reply(
+        f"✅ Криптореквизиты добавлены!\n🪙 {second} | 🌐 {rest}\n<code>{first}</code>",
+        parse_mode="HTML",
+    )
+  else:
+    parts = args[1].split()
+    country = parts[-1]
+    bank = parts[-2]
+    details = " ".join(parts[:-2])
+    CARD_DETAILS.append({
+        "details": details,
+        "bank": bank,
+        "country": country,
+        "frozen_until": None,
+    })
+    await add_card_db(details, bank, country)
+    await message.reply(
+        f"✅ Реквизиты добавлены!\n🌍 {country} | 🏦 {bank}\n<code>{details}</code>",
+        parse_mode="HTML",
+    )
 
 
 @router.message(Command("delete"))
-async def cmd_delete_card(message: Message):
+async def cmd_delete_requisites(message: Message):
   if ADMIN_ID and message.from_user.id != ADMIN_ID:
     return
-  global CARD_DETAILS  
+  global CARD_DETAILS, CRYPTO_WALLETS
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
-    await message.reply("❌ Использование: `/delete <реквизиты> <Банк> <Страна>`", parse_mode="Markdown")
+    await message.reply("❌ Использование: `/delete <реквизиты/адрес> <валюта/банк> <сеть/страна>`", parse_mode="Markdown")
     return
-  parts = args[1].split()
-  if len(parts) < 3:
+  parsed = _parse_wallet_args(args[1])
+  if not parsed:
     await message.reply("❌ Неверный формат.")
     return
+  first, second, rest = parsed
+
+  if _is_crypto_asset_and_network(second, rest):
+    target_net = _normalize_network(rest)
+    initial_len = len(CRYPTO_WALLETS)
+    CRYPTO_WALLETS = [
+        w
+        for w in CRYPTO_WALLETS
+        if not (
+            w["address"] == first
+            and w["asset"].upper() == second
+            and _normalize_network(w["network"]) == target_net
+        )
+    ]
+    if len(CRYPTO_WALLETS) < initial_len:
+      await sync_crypto_wallets_db()
+      await message.reply("✅ Криптореквизиты удалены.")
+      return
+
+  parts = args[1].split()
   country = parts[-1]
   bank = parts[-2]
   details = " ".join(parts[:-2])
-  initial_len = len(CARD_DETAILS)
-  CARD_DETAILS = [c for c in CARD_DETAILS if not (c["details"] == details and c["bank"] == bank and c["country"].lower() == country.lower())]
-  if len(CARD_DETAILS) < initial_len:
+  initial_card_len = len(CARD_DETAILS)
+  CARD_DETAILS = [
+      c
+      for c in CARD_DETAILS
+      if not (c["details"] == details and c["bank"] == bank and c["country"].lower() == country.lower())
+  ]
+  if len(CARD_DETAILS) < initial_card_len:
+    await sync_card_details_db()
     await message.reply("✅ Удалено.")
   else:
     await message.reply("❌ Не найдено.")
 
 
 @router.message(Command("freeze"))
-async def cmd_freeze_card(message: Message):
+async def cmd_freeze_requisites(message: Message):
   if ADMIN_ID and message.from_user.id != ADMIN_ID:
     return
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
-    await message.reply("❌ Использование: `/freeze <реквизиты> <Банк> <Страна>`", parse_mode="Markdown")
+    await message.reply("❌ Использование: `/freeze <реквизиты/адрес> <валюта/банк> <сеть/страна>`", parse_mode="Markdown")
     return
-  parts = args[1].split()
-  if len(parts) < 3:
+  parsed = _parse_wallet_args(args[1])
+  if not parsed:
     await message.reply("❌ Неверный формат.")
     return
+  first, second, rest = parsed
+  until_dt = datetime.datetime.now() + datetime.timedelta(hours=24)
+
+  if _is_crypto_asset_and_network(second, rest):
+    target_net = _normalize_network(rest)
+    found = False
+    for w in CRYPTO_WALLETS:
+      if (
+          w["address"] == first
+          and w["asset"].upper() == second
+          and _normalize_network(w["network"]) == target_net
+      ):
+        w["frozen_until"] = until_dt
+        found = True
+        break
+    if found:
+      await sync_crypto_wallets_db()
+      await message.reply("✅ Криптореквизиты зафрижены на 24 часа.")
+      return
+
+  parts = args[1].split()
   country = parts[-1]
   bank = parts[-2]
   details = " ".join(parts[:-2])
-  found = False
-  now = datetime.datetime.now()
+  found_card = False
   for card in CARD_DETAILS:
     if card["details"] == details and card["bank"] == bank and card["country"].lower() == country.lower():
-      card["frozen_until"] = now + datetime.timedelta(hours=24)
-      found = True
+      card["frozen_until"] = until_dt
+      found_card = True
       break
-  if found:
+  if found_card:
+    await sync_card_details_db()
     await message.reply("✅ Зафрижено на 24 часа.")
   else:
     await message.reply("❌ Не найдено.")
@@ -708,7 +1282,12 @@ async def create_cryptobot_invoice(amount_usd: float, description: str):
     return "", None
   url = "https://pay.crypt.bot/api/createInvoice"
   headers = {"Crypto-Pay-API-Token": CRYPTO_BOT_TOKEN}
-  payload = {"asset": "USDT", "amount": str(amount_usd), "description": description, "payload": "order_payment"}
+  payload = {
+      "asset": "USDT",
+      "amount": str(amount_usd),
+      "description": description,
+      "payload": "order_payment",
+  }
   try:
     async with ClientSession() as session:
       async with session.post(url, json=payload, headers=headers, timeout=10) as resp:
@@ -749,23 +1328,39 @@ async def scheduled_broadcast(bot: Bot):
     now = datetime.datetime.now()
     banner_path = get_banner_path("special_offer.jpg")
     for user_id, last_time in list(KNOWN_USERS.items()):
-      if is_user_banned(user_id):
+      if await is_user_banned(user_id):
         continue
       if last_time is None or (now - last_time).total_seconds() >= 24 * 3600:
         try:
           today = datetime.date.today()
           target_date = today + datetime.timedelta(days=3)
-          months_ru = ["", "января", "февраля", "марта", "апреля", "мая", "июня", "июля", "августа", "сентября", "октября", "ноября", "декабря"]
+          months_ru = [
+              "",
+              "января",
+              "февраля",
+              "марта",
+              "апреля",
+              "мая",
+              "июня",
+              "июля",
+              "августа",
+              "сентября",
+              "октября",
+              "ноября",
+              "декабря",
+          ]
           text = (
               "✨ <b>Специальное предложение</b>\n\n"
               f"Действует персональная скидка <b>20%</b> до <b>{target_date.day} {months_ru[target_date.month]}</b>.\n\n"
               "Ждем вас в боте 👇"
           )
-          keyboard = InlineKeyboardMarkup(inline_keyboard=[
-              [InlineKeyboardButton(text="✨ Оформить со скидкой", callback_data="catalog_services", style="primary")],
-              [InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="danger")]
-          ])
-          
+          keyboard = InlineKeyboardMarkup(
+              inline_keyboard=[
+                  [InlineKeyboardButton(text="✨ Оформить со скидкой", callback_data="catalog_services", style="primary")],
+                  [InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="danger")],
+              ]
+          )
+
           if "special_offer.jpg" in BANNER_CACHE:
             photo = BANNER_CACHE["special_offer.jpg"]
             await bot.send_photo(chat_id=user_id, photo=photo, caption=text, reply_markup=keyboard, parse_mode="HTML")
@@ -776,7 +1371,7 @@ async def scheduled_broadcast(bot: Bot):
               BANNER_CACHE["special_offer.jpg"] = sent.photo[-1].file_id
           else:
             await bot.send_message(chat_id=user_id, text=text, reply_markup=keyboard, parse_mode="HTML")
-            
+
           KNOWN_USERS[user_id] = now
         except Exception as e:
           logger.error(f"Ошибка рассылки: {e}")
@@ -785,27 +1380,33 @@ async def scheduled_broadcast(bot: Bot):
 async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int):
   try:
     await asyncio.sleep(1800)
-    if is_user_banned(user_id):
+    if await is_user_banned(user_id):
       return
     if user_id in ABANDONED_CHECKOUTS:
-      reminder_text = "👋 <b>Завершить заказ со скидкой -20%?</b>\n\nВы остановились на этапе оплаты. Возвращайтесь к оформлению 👇"
-      keyboard = InlineKeyboardMarkup(inline_keyboard=[
-          [InlineKeyboardButton(text="🛒 Вернуться к заказу", callback_data="catalog_services", style="primary")],
-          [InlineKeyboardButton(text="💬 Поддержка", callback_data="contact_admin", style="primary")]
-      ])
-      
+      reminder_text = (
+          "👋 <b>Завершить заказ со скидкой -20%?</b>\n\nВы остановились на этапе оплаты. Возвращайтесь к оформлению 👇"
+      )
+      keyboard = InlineKeyboardMarkup(
+          inline_keyboard=[
+              [InlineKeyboardButton(text="🛒 Вернуться к заказу", callback_data="catalog_services", style="primary")],
+              [InlineKeyboardButton(text="💬 Поддержка", callback_data="contact_admin", style="primary")],
+          ]
+      )
+
       banner_path = get_banner_path("abandoned_cart.jpg")
       if "abandoned_cart.jpg" in BANNER_CACHE:
         photo = BANNER_CACHE["abandoned_cart.jpg"]
         await bot.send_photo(chat_id=user_id, photo=photo, caption=reminder_text, reply_markup=keyboard, parse_mode="HTML")
       elif banner_path and os.path.exists(banner_path):
         photo = FSInputFile(banner_path)
-        sent = await bot.send_photo(chat_id=user_id, photo=photo, caption=reminder_text, reply_markup=keyboard, parse_mode="HTML")
+        sent = await bot.send_photo(
+            chat_id=user_id, photo=photo, caption=reminder_text, reply_markup=keyboard, parse_mode="HTML"
+        )
         if sent.photo:
           BANNER_CACHE["abandoned_cart.jpg"] = sent.photo[-1].file_id
       else:
         await bot.send_message(chat_id=user_id, text=reminder_text, reply_markup=keyboard, parse_mode="HTML")
-        
+
       ABANDONED_CHECKOUTS.pop(user_id, None)
   except asyncio.CancelledError:
     pass
@@ -818,7 +1419,7 @@ def get_order_details_text(data):
 # === ОБРАБОТЧИКИ КОМАНД ===
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   await show_main_menu(message, state)
 
 
@@ -830,7 +1431,7 @@ async def cmd_restart(message: Message, state: FSMContext):
 
 @router.message(Command("order"))
 async def cmd_order(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   user_id = message.from_user.id
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
@@ -841,22 +1442,29 @@ async def cmd_order(message: Message, state: FSMContext):
 
 @router.message(Command("my_orders"))
 async def cmd_my_orders_msg(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   user_id = message.from_user.id
-  orders = get_user_orders_from_db(user_id)
+  orders = await get_user_orders_from_db(user_id)
   if not orders:
     text = "📦 <b>Мои заказы</b>\n\nУ вас пока нет активных или завершенных заказов."
   else:
     text = "📦 <b>История ваших заказов:</b>\n\n"
     for ord_data in orders:
-      text += f"<b>Заказ #{ord_data['id']}</b>\n• Услуга: {ord_data['service_name']}\n• Сумма: {ord_data['total_price']}$\n• Статус: {ord_data['status']}\n\n"
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]])
+      text += (
+          f"<b>Заказ #{ord_data['id']}</b>\n"
+          f"• Услуга: {ord_data['service_name']}\n"
+          f"• Сумма: {_format_price(ord_data['total_price'])}$\n"
+          f"• Статус: {ord_data['status']}\n\n"
+      )
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]]
+  )
   await render_step(message, state, "my_orders.jpg", text, keyboard)
 
 
 @router.message(Command("reputation"))
 async def cmd_reputation_msg(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   completed, in_progress, new_requests = get_reputation_stats()
   text = (
       "📊 <b>Репутация сервиса</b>\n\n"
@@ -865,7 +1473,9 @@ async def cmd_reputation_msg(message: Message, state: FSMContext):
       f"• Новых заявок сегодня: <b>{new_requests}</b>\n\n"
       "<i>Конфиденциальность и безопасность гарантированы.</i>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]]
+  )
   await render_step(message, state, "reputation.jpg", text, keyboard)
 
 
@@ -888,28 +1498,39 @@ async def show_reputation(callback: CallbackQuery, state: FSMContext):
       f"• Новых заявок сегодня: <b>{new_requests}</b>\n\n"
       "<i>Конфиденциальность и безопасность гарантированы.</i>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]]
+  )
   await render_step(callback, state, "reputation.jpg", text, keyboard)
 
 
 @router.callback_query(F.data == "my_orders")
 async def show_my_orders(callback: CallbackQuery, state: FSMContext):
   user_id = callback.from_user.id
-  orders = get_user_orders_from_db(user_id)
+  orders = await get_user_orders_from_db(user_id)
   if not orders:
     text = "📦 <b>Мои заказы</b>\n\nУ вас пока нет активных или завершенных заказов."
   else:
     text = "📦 <b>История ваших заказов:</b>\n\n"
     for ord_data in orders:
-      text += f"<b>Заказ #{ord_data['id']}</b>\n• Услуга: {ord_data['service_name']}\n• Сумма: {ord_data['total_price']}$\n• Статус: {ord_data['status']}\n\n"
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]])
+      text += (
+          f"<b>Заказ #{ord_data['id']}</b>\n"
+          f"• Услуга: {ord_data['service_name']}\n"
+          f"• Сумма: {_format_price(ord_data['total_price'])}$\n"
+          f"• Статус: {ord_data['status']}\n\n"
+      )
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_home", style="danger")]]
+  )
   await render_step(callback, state, "my_orders.jpg", text, keyboard)
 
 
 @router.callback_query(F.data == "contact_admin")
 async def contact_admin_info(callback: CallbackQuery, state: FSMContext):
   await state.set_state(SupportForm.reason)
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_home", style="primary")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_home", style="primary")]]
+  )
   text = (
       "💬 <b>Служба поддержки</b>\n\n"
       "Опишите вашу ситуацию или задайте вопрос (оплата, статус заказа и т.д.):"
@@ -919,26 +1540,32 @@ async def contact_admin_info(callback: CallbackQuery, state: FSMContext):
 
 @router.message(SupportForm.reason, F.text)
 async def process_support_reason(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   await state.update_data(reason=message.text.strip())
   await state.set_state(SupportForm.photo)
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_support_photo", style="danger")],
-      [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_home", style="primary")]
-  ])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="⏩ Пропустить", callback_data="skip_support_photo", style="danger")],
+          [InlineKeyboardButton(text="⬅️ Отмена", callback_data="back_home", style="primary")],
+      ]
+  )
   text = "📸 Отправьте фото при необходимости или нажмите пропустить:"
   await render_step(message, state, "support.jpg", text, keyboard)
 
 
 @router.message(SupportForm.photo, F.photo)
 async def process_support_photo(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   photo_id = message.photo[-1].file_id
   data = await state.get_data()
   user = message.from_user
   user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
   reason_text = data.get("reason") or "Без описания"
-  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {reason_text}"
+  admin_text = (
+      f"📩 <b>Новое обращение в поддержку</b>\n\n"
+      f"• От кого: {user_info} (<code>{user.id}</code>)\n"
+      f"• Вопрос: {reason_text}"
+  )
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
   for uid in notify_ids:
     try:
@@ -946,19 +1573,28 @@ async def process_support_photo(message: Message, state: FSMContext):
     except Exception:
       pass
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
   await render_step(message, state, "main.jpg", text, keyboard)
   await state.clear()
 
 
 @router.callback_query(SupportForm.photo, F.data == "skip_support_photo")
 async def skip_support_photo(callback: CallbackQuery, state: FSMContext):
-  track_user(callback.from_user)
+  await track_user(callback.from_user)
   data = await state.get_data()
   user = callback.from_user
   user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
-  reason_text = data.get("reason") or (callback.message.caption if callback.message and callback.message.caption else "Обращение без текста")
-  admin_text = f"📩 <b>Новое обращение в поддержку</b>\n\n• От кого: {user_info} (<code>{user.id}</code>)\n• Вопрос: {reason_text}"
+  reason_text = (
+      data.get("reason")
+      or (callback.message.caption if callback.message and callback.message.caption else "Обращение без текста")
+  )
+  admin_text = (
+      f"📩 <b>Новое обращение в поддержку</b>\n\n"
+      f"• От кого: {user_info} (<code>{user.id}</code>)\n"
+      f"• Вопрос: {reason_text}"
+  )
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
   for uid in notify_ids:
     try:
@@ -967,7 +1603,9 @@ async def skip_support_photo(callback: CallbackQuery, state: FSMContext):
       logger.error(f"Ошибка отправки обращения в поддержку ({uid}): {e}")
 
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
   await state.clear()
   await render_step(callback, state, "main.jpg", text, keyboard)
 
@@ -991,7 +1629,9 @@ async def process_special_order_service(callback: CallbackQuery, state: FSMConte
   await state.update_data(service_name=service_name, total_price=0)
   await state.set_state(OrderForm.target_username)
 
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+  )
   text = (
       f"🛠 Услуга: <b>{service_name}</b>\n\n"
       f"📝 <b>Описание задачи</b>\n\n"
@@ -1009,13 +1649,15 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
   await state.update_data(service_name=service_name, total_price=price)
   await state.set_state(OrderForm.target_username)
 
-  link_services = ["снос сайта", "снос tg канала или бота", "ddos-атака сайта"]
+  link_services = ["снос сайта", "снос tg канала или бота", "ddos-атака сайта", "слив базы сайта"]
   if service_name.lower() in link_services:
     target_prompt = "Введите ссылку на ресурс цели следующим сообщением:"
   else:
     target_prompt = "Введите юзернейм или ссылку на профиль цели следующим сообщением:"
 
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+  )
   text = (
       f"⚡️ Услуга: <b>{service_name} ({price}$)</b>\n\n"
       f"🎯 <b>Данные цели</b>\n\n"
@@ -1026,14 +1668,16 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
 
 @router.message(OrderForm.target_username, F.text)
 async def process_target_username(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   data = await state.get_data()
   price = data.get("total_price", 0)
 
   if not price:
     await state.update_data(special_task=message.text.strip())
     await state.set_state(OrderForm.special_link)
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]])
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+    )
     text = (
         f"🛠 Услуга: <b>{data.get('service_name')}</b>\n\n"
         f"🔗 <b>Ссылка на цель</b>\n\n"
@@ -1048,18 +1692,20 @@ async def process_target_username(message: Message, state: FSMContext):
       "✨ <b>Сводка заказа:</b>\n\n"
       f"• Услуга: <b>{updated_data.get('service_name')}</b>\n"
       f"{get_order_details_text(updated_data)}"
-      f"💵 <b>Сумма к оплате: {price}$</b>"
+      f"💵 <b>К оплате: {_format_price(price)} USDT</b>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]
-  ])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")],
+      ]
+  )
   await render_step(message, state, "summary.jpg", summary_text, keyboard)
 
 
 @router.message(OrderForm.special_link, F.text)
 async def process_special_order_link(message: Message, state: FSMContext):
-  track_user(message.from_user)
+  await track_user(message.from_user)
   link = message.text.strip()
   data = await state.get_data()
   task_desc = data.get("special_task", "")
@@ -1084,7 +1730,9 @@ async def process_special_order_link(message: Message, state: FSMContext):
       pass
 
   text = "✅ Заявка отправлена менеджеру! В течение 25 минут с вами свяжется специалист для расчёта стоимости."
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
   await state.clear()
   await render_step(message, state, "main.jpg", text, keyboard)
 
@@ -1105,7 +1753,7 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
       "⏳ <b>Оплата заказа</b>\n"
       "Время на завершение: <b><u>20:00</u></b>\n\n"
       f"💳 <b>Выберите способ оплаты</b>\n"
-      f"Сумма: <b>{_format_price(total_price)}$</b>"
+      f"К оплате: <b>{_format_price(total_price)} USDT</b>"
   )
   await render_step(callback, state, "payment.jpg", payment_text, _build_payment_keyboard())
 
@@ -1125,32 +1773,35 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
   if not card:
     text = (
         f"❌ <b>Реквизиты временно недоступны</b>\n\n"
-        f"В данный момент реквизиты для оплаты в <b>{config['name']}</b> недоступны. Воспользуйтесь CryptoBot или криптовалютой 👇"
+        f"Сейчас реквизиты для оплаты в <b>{config['name']}</b> временно недоступны, мы решаем эту проблему. "
+        f"Оплатите другим способом (CryptoBot или криптовалюта) 👇"
     )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="🤖 CryptoBot", callback_data="pay_cryptobot", style="primary")],
-            [InlineKeyboardButton(text="🪙 Криптовалюта", callback_data="crypto_expert", style="danger")],
-            [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]
+            [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
+            [InlineKeyboardButton(text="🪙 Реквизиты (Крипта)", callback_data="crypto_expert", style="danger")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")],
         ]
     )
     await render_step(callback, state, "payment.jpg", text, keyboard)
     return
 
-  sbp_line = "<b>Метод:</b> СБП / Перевод\n" if curr_code == "RUB" else ""
+  sbp_line = "<b>Метод:</b> Карта / СБП / Перевод по номеру\n" if curr_code == "RUB" else "<b>Метод:</b> Карта / Перевод по номеру\n"
   text = (
       f"💳 <b>Оплата ({config['name']})</b>\n\n"
-      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_price(total_price)}$)</i>\n\n"
+      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_price(total_price)} USDT)</i>\n\n"
       f"⚠️ <b>Переводите строго на реквизиты ниже:</b>\n\n"
       f"{sbp_line}"
       f"<b>Банк:</b> {card['bank']}\n"
       f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
       "💡 <i>После перевода нажмите кнопку ниже для отправки чека.</i>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="✅ Прикрепить чек", callback_data="ask_for_receipt", style="primary")],
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]
-  ])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="✅ Прикрепить чек", callback_data="ask_for_receipt", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")],
+      ]
+  )
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
@@ -1160,7 +1811,11 @@ async def process_payment_help_manager(callback: CallbackQuery):
   for uid in notify_ids:
     try:
       user = callback.from_user
-      await callback.bot.send_message(chat_id=uid, text=f"🚨 Запрос помощи с оплатой от @{user.username} (<code>{user.id}</code>)", parse_mode="HTML")
+      await callback.bot.send_message(
+          chat_id=uid,
+          text=f"🚨 Запрос помощи с оплатой от @{user.username} (<code>{user.id}</code>)",
+          parse_mode="HTML",
+      )
     except Exception:
       pass
   await callback.answer("✅ Менеджер уведомлен, скоро свяжется с вами.", show_alert=True)
@@ -1184,7 +1839,11 @@ async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")],
       ]
   )
-  text = f"🤖 <b>CryptoBot</b>\n\nСумма: <b>{_format_price(total_price)} USDT</b>\n\nПосле оплаты нажмите кнопку проверки:"
+  text = (
+      f"🤖 <b>Оплата через CryptoBot</b>\n\n"
+      f"К оплате: <b>{_format_price(total_price)} USDT</b>\n\n"
+      f"После оплаты нажмите кнопку проверки:"
+  )
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
@@ -1192,7 +1851,7 @@ async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
 async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   data = await state.get_data()
   inv_id = data.get("invoice_id")
-  
+
   is_paid = await check_cryptobot_invoice_status(inv_id)
   if not is_paid:
     await callback.answer("⏳ Платеж еще не поступил. Попробуйте через минуту.", show_alert=True)
@@ -1209,22 +1868,29 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   target_username = ctx["target_username"]
   target_info = f"Цель: {target_username}"
 
-  add_order_to_db(user.id, service_name, total_price, "✅ Оплачено через CryptoBot", target_info)
+  await add_order_to_db(user.id, service_name, total_price, "✅ Оплачено через CryptoBot", target_info)
   PENDING_BILLS.pop(user.id, None)
+  await delete_pending_bill_db(user.id)
 
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
   for uid in notify_ids:
     try:
       await callback.bot.send_message(
           chat_id=uid,
-          text=f"🤖 Успешная оплата CryptoBot от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {target_username}",
-          parse_mode="HTML"
+          text=(
+              f"🤖 Успешная оплата CryptoBot от @{user.username} (<code>{user.id}</code>)\n"
+              f"• Услуга: {service_name}\n"
+              f"• Цель: {target_username}"
+          ),
+          parse_mode="HTML",
       )
     except Exception:
       pass
 
   text = "✅ <b>Оплата подтверждена!</b>\n\nВаша заявка принята в работу."
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
   await render_step(callback, state, "main.jpg", text, keyboard)
   await state.clear()
 
@@ -1235,12 +1901,12 @@ async def process_crypto_expert(callback: CallbackQuery, state: FSMContext):
       inline_keyboard=[
           [InlineKeyboardButton(text="💎 USDT (TRC-20)", callback_data="pay_crypto_trc20", style="primary")],
           [InlineKeyboardButton(text="💵 USDT (BEP-20)", callback_data="pay_crypto_bep20", style="danger")],
-          [InlineKeyboardButton(text="🪙 TON", callback_data="pay_crypto_ton", style="primary")],
+          [InlineKeyboardButton(text="🪙 USDT (TON)", callback_data="pay_crypto_ton", style="primary")],
           [InlineKeyboardButton(text="🪙 Bitcoin (BTC)", callback_data="pay_crypto_btc", style="danger")],
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")],
       ]
   )
-  text = "🪙 Выберите криптовалютную сеть для перевода:"
+  text = "🪙 <b>Реквизиты (Крипта)</b>\n\nВыберите криптовалютную сеть для перевода:"
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
@@ -1254,25 +1920,46 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
 
   ctx = await _get_payment_context(callback.from_user.id, state)
   total_price = ctx["total_price"]
+  wallet = get_next_crypto_wallet(net_key)
+
+  if not wallet:
+    text = (
+        "❌ <b>Реквизиты временно недоступны</b>\n\n"
+        "Сейчас реквизиты временно недоступны, мы решаем эту проблему. "
+        "Оплатите другим способом (CryptoBot или карта/валюта) 👇"
+    )
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="crypto_expert", style="danger")],
+        ]
+    )
+    await render_step(callback, state, "payment.jpg", text, keyboard)
+    return
 
   text = (
       f"💳 <b>Оплата {net_info['name']}</b>\n\n"
-      f"• Сумма: <b>{_format_price(total_price)}$</b>\n"
-      f"• Сеть: <b>{net_info['network']}</b>\n"
-      f"• Реквизиты:\n<code>{net_info['address']}</code>\n\n"
+      f"• К оплате: <b>{_format_price(total_price)} USDT</b>\n"
+      f"• Монета: <b>{wallet['asset']}</b>\n"
+      f"• Сеть: <b>{wallet['network']}</b>\n"
+      f"• Реквизиты:\n<code>{wallet['address']}</code>\n\n"
       "💡 <i>После перевода прикрепите чек.</i>"
   )
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[
-      [InlineKeyboardButton(text="✅ Прикрепить чек", callback_data="ask_for_receipt", style="primary")],
-      [InlineKeyboardButton(text="⬅️ Назад", callback_data="crypto_expert", style="danger")]
-  ])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="✅ Прикрепить чек", callback_data="ask_for_receipt", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="crypto_expert", style="danger")],
+      ]
+  )
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
 
 @router.callback_query(F.data == "ask_for_receipt")
 async def ask_for_receipt(callback: CallbackQuery, state: FSMContext):
   await state.set_state(OrderForm.receipt)
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]])
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]]
+  )
   text = "🧾 Отправьте скриншот или фото чека следующим сообщением:"
   await render_step(callback, state, "payment.jpg", text, keyboard)
 
@@ -1290,8 +1977,9 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   target_username = ctx["target_username"]
   target_info = f"Цель: {target_username}"
 
-  add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
+  await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
   PENDING_BILLS.pop(user.id, None)
+  await delete_pending_bill_db(user.id)
 
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
   for uid in notify_ids:
@@ -1299,15 +1987,22 @@ async def process_receipt_photo(message: Message, state: FSMContext):
       await message.bot.send_photo(
           chat_id=uid,
           photo=message.photo[-1].file_id,
-          caption=f"🛒 Новый чек от @{user.username} (<code>{user.id}</code>)\n• Услуга: {service_name}\n• Цель: {target_username}\n• Сумма: {_format_price(total_price)}$",
-          parse_mode="HTML"
+          caption=(
+              f"🛒 Новый чек от @{user.username} (<code>{user.id}</code>)\n"
+              f"• Услуга: {service_name}\n"
+              f"• Цель: {target_username}\n"
+              f"• К оплате: {_format_price(total_price)} USDT"
+          ),
+          parse_mode="HTML",
       )
     except Exception:
       pass
 
   text = "✅ Чек получен! Менеджер проверит платеж в течение 25 минут."
-  keyboard = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]])
-  await render_step(callback, state, "main.jpg", text, keyboard)
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
+  await render_step(message, state, "main.jpg", text, keyboard)
   await state.clear()
 
 
@@ -1316,13 +2011,16 @@ async def process_receipt_photo(message: Message, state: FSMContext):
 async def fallback_target_username(message: Message):
   await message.reply("⚠️ Пожалуйста, отправьте текстовое сообщение с описанием задачи.")
 
+
 @router.message(OrderForm.special_link)
 async def fallback_special_link(message: Message):
   await message.reply("⚠️ Пожалуйста, отправьте текстовое сообщение со ссылкой на цель.")
 
+
 @router.message(OrderForm.receipt)
 async def fallback_order_receipt(message: Message):
   await message.reply("⚠️ Пожалуйста, отправьте скриншот или фото чека об оплате.")
+
 
 @router.message(SupportForm.reason)
 async def fallback_support_message(message: Message):
@@ -1332,6 +2030,7 @@ async def fallback_support_message(message: Message):
 # === WEB SERVER FOR RENDER / RAILWAY ===
 async def handle_ping(request):
   return web.Response(text="Bot is running!")
+
 
 async def start_web_server():
   app = web.Application()
@@ -1344,11 +2043,12 @@ async def start_web_server():
 
 
 async def main():
-  init_db()
+  await init_db()
+  await load_persistent_state()
   bot = Bot(token=BOT_TOKEN)
   dp = Dispatcher()
   dp.include_router(router)
-  
+
   try:
     await bot.set_my_commands([
         BotCommand(command="start", description="Главное меню"),
@@ -1359,11 +2059,11 @@ async def main():
     ])
   except Exception as e:
     logger.warning(f"Не удалось установить команды: {e}")
-  
+
   asyncio.create_task(start_web_server())
   asyncio.create_task(scheduled_broadcast(bot))
   await bot.delete_webhook(drop_pending_updates=True)
-  
+
   while True:
     try:
       logger.info("Запуск поллинга кибер-бота...")
