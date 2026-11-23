@@ -700,6 +700,20 @@ async def get_all_orders_from_db():
     ]
 
 
+async def get_users_and_bans_counts() -> tuple[int, int]:
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      users_cnt = await conn.fetchval("SELECT COUNT(*) FROM users")
+      bans_cnt = await conn.fetchval("SELECT COUNT(*) FROM banned_users")
+      return int(users_cnt or 0), int(bans_cnt or 0)
+
+  with sqlite3.connect("bot_database.db") as conn:
+    cursor = conn.cursor()
+    users_row = cursor.execute("SELECT COUNT(*) FROM users").fetchone()
+    bans_row = cursor.execute("SELECT COUNT(*) FROM banned_users").fetchone()
+    return int(users_row[0] if users_row else 0), int(bans_row[0] if bans_row else 0)
+
+
 async def is_user_banned(user_id: int, username: str | None = None) -> bool:
   target_ids = {int(user_id)}
   if username:
@@ -1127,7 +1141,6 @@ async def _send_unpaid_order_manager_alert(
   if not (j.get("service_selected") or j.get("has_unpaid_active") or user_id in PENDING_BILLS):
     return
 
-  # Фиксируем факт отправки на текущий заход на выбор способа оплаты, чтобы не было дублей
   cycle_seq = int(j.get("payment_cycle_seq", 0))
   cycle_sent_key = (user_id, f"payment_method_alert_cycle_{cycle_seq}")
   if cycle_sent_key in UNPAID_ALERT_SENT_KEYS:
@@ -3115,10 +3128,13 @@ async def cmd_list_requisites(message: Message):
   if wallets_changed:
     await sync_crypto_wallets_db()
 
+  users_in_db_count, bans_count = await get_users_and_bans_counts()
+
   lines = [
       "📋 <b>Реестр реквизитов</b>",
       f"• Активных карт/СБП: <b>{len(active_cards)}</b> | Заморожено: <b>{len(frozen_cards)}</b>",
-      f"• Активных криптокошельков: <b>{len(active_wallets)}</b> | Заморожено: <b>{len(frozen_wallets)}</b>\n",
+      f"• Активных криптокошельков: <b>{len(active_wallets)}</b> | Заморожено: <b>{len(frozen_wallets)}</b>",
+      f"• Пользователей в базе: <b>{users_in_db_count}</b> (банов: <b>{bans_count}</b>)\n",
       "━━━━━━━━━━━━━━━━━━━━",
       "💳 <b>Актуальные карты / СБП / номера:</b>",
   ]
