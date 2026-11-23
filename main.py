@@ -1458,23 +1458,21 @@ async def cmd_manager_bill(message: Message):
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply(
-        "❌ Использование: `/bill <user_id> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`",
+        "❌ Использование: `/bill <user_id или @username> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`",
         parse_mode="Markdown",
     )
     return
 
-  if is_pure_manager(message.from_user.id):
-    forbidden_reason = _check_manager_forbidden_requisites(args[1])
-    if forbidden_reason:
-      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
-      return
-
   parts = args[1].strip().split()
-  if len(parts) < 2 or not parts[0].isdigit():
+  if len(parts) < 2:
     await message.reply("❌ Неверный формат. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
     return
 
-  target_user_id = int(parts[0])
+  target_user_id = _resolve_user_target(parts[0])
+  if not target_user_id:
+    await message.reply("❌ Неверный ID или @username пользователя.")
+    return
+
   raw_amount = parts[-1].rstrip("$").strip()
   try:
     amount = float(raw_amount)
@@ -1485,6 +1483,12 @@ async def cmd_manager_bill(message: Message):
   service_name = " ".join(parts[1:-1]).strip() if len(parts) > 2 else "Особый заказ"
   if not service_name:
     service_name = "Особый заказ"
+
+  if is_pure_manager(message.from_user.id):
+    forbidden_reason = _check_manager_forbidden_requisites(service_name)
+    if forbidden_reason:
+      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
+      return
 
   bill_obj = {
       "service_name": service_name,
