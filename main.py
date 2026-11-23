@@ -81,7 +81,7 @@ BANNER_CACHE = {}
 PENDING_BILLS = {}
 
 # Активные треды / обращения и отслеживание шагов клиентов
-ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task, "expires_at": datetime.datetime, "closed": bool, "kind": str}
+ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task | None, "expires_at": datetime.datetime | None, "closed": bool, "kind": str}
 CLIENT_JOURNEY = {}  # user_id -> dict
 UNPAID_FOLLOWUP_TASKS = {}  # user_id -> asyncio.Task
 CLOSED_TICKETS = set()  # (client_id, ticket_kind)
@@ -1470,25 +1470,8 @@ def _staff_paid_order_keyboard(client_id: int) -> InlineKeyboardMarkup:
 
 
 async def _auto_close_send_thread(bot: Bot, client_id: int, delay_seconds: float = 3600.0):
-  try:
-    await asyncio.sleep(delay_seconds)
-    thread = ACTIVE_SEND_THREADS.get(client_id)
-    if not thread or thread.get("closed"):
-      return
-    thread["closed"] = True
-    ACTIVE_SEND_THREADS.pop(client_id, None)
-    if await is_user_banned(client_id, USER_MAPPING.get(client_id)):
-      return
-    try:
-      await bot.send_message(
-          chat_id=client_id,
-          text="🔒 <b>Обращение автоматически закрыто</b> по истечении 1 часа без активности.",
-          parse_mode="HTML",
-      )
-    except Exception as e:
-      logger.warning(f"Не удалось отправить уведомление об автозакрытии треда ({client_id}): {e}")
-  except asyncio.CancelledError:
-    pass
+  # Автозакрытие по таймеру отключено: обращение не закрывается по истечении времени.
+  return
 
 
 async def _activate_send_thread(bot: Bot, client_id: int, kind: str = "send"):
@@ -1497,11 +1480,9 @@ async def _activate_send_thread(bot: Bot, client_id: int, kind: str = "send"):
   old = ACTIVE_SEND_THREADS.pop(client_id, None)
   if old and old.get("task"):
     old["task"].cancel()
-  expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
-  task = asyncio.create_task(_auto_close_send_thread(bot, client_id, delay_seconds=3600.0))
   ACTIVE_SEND_THREADS[client_id] = {
-      "task": task,
-      "expires_at": expires_at,
+      "task": None,
+      "expires_at": None,
       "closed": False,
       "kind": kind,
   }
