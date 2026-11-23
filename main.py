@@ -1502,7 +1502,7 @@ async def cmd_manager_bill(message: Message):
   bill_text = (
       f"🧾 <b>Вам выставлен счет на {service_name}</b>\n\n"
       f"• Услуга: <b>{service_name}</b>\n"
-      f"• К оплате: <b>{price_str} USDT</b>\n\n"
+      f"• К оплате: <b>{price_str}$</b>\n\n"
       f"Выберите способ оплаты ниже, чтобы получить реквизиты:"
   )
   try:
@@ -1513,7 +1513,7 @@ async def cmd_manager_bill(message: Message):
         reply_markup=_build_payment_keyboard(),
     )
     await message.reply(
-        f"✅ Счет на <b>{service_name}</b> (<b>{price_str} USDT</b>) отправлен пользователю <code>{target_user_id}</code>.",
+        f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>.",
         parse_mode="HTML",
     )
   except Exception as e:
@@ -2646,7 +2646,7 @@ async def process_target_username(message: Message, state: FSMContext):
       "✨ <b>Сводка заказа:</b>\n\n"
       f"• Услуга: <b>{updated_data.get('service_name')}</b>\n"
       f"{get_order_details_text(updated_data)}"
-      f"💵 <b>К оплате: {_format_price(price)} USDT</b>"
+      f"💵 <b>К оплате: {_format_price(price)}$</b>"
   )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
@@ -2726,7 +2726,7 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
       "⏳ <b>Оплата заказа</b>\n"
       "Время на завершение: <b><u>20:00</u></b>\n\n"
       f"💳 <b>Выберите способ оплаты</b>\n"
-      f"К оплате: <b>{_format_price(total_price)} USDT</b>"
+      f"К оплате: <b>{_format_price(total_price)}$</b>"
   )
   await render_step(callback, state, "payment.jpg", payment_text, _build_payment_keyboard())
 
@@ -2771,7 +2771,7 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
   sbp_line = "<b>Метод:</b> Карта / СБП / Перевод по номеру\n" if curr_code == "RUB" else "<b>Метод:</b> Карта / Перевод по номеру\n"
   text = (
       f"💳 <b>Оплата ({config['name']})</b>\n\n"
-      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_price(total_price)} USDT)</i>\n\n"
+      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_price(total_price)}$)</i>\n\n"
       f"⚠️ <b>Переводите строго на реквизиты ниже:</b>\n\n"
       f"{sbp_line}"
       f"<b>Банк:</b> {card['bank']}\n"
@@ -2942,9 +2942,14 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
     await render_step(callback, state, "payment.jpg", text, keyboard)
     return
 
+  amount_display = (
+      f"{_format_price(total_price)}$"
+      if net_key == "btc"
+      else f"{_format_price(total_price)} USDT"
+  )
   text = (
       f"💳 <b>Оплата {net_info['name']}</b>\n\n"
-      f"• К оплате: <b>{_format_price(total_price)} USDT</b>\n"
+      f"• К оплате: <b>{amount_display}</b>\n"
       f"• Монета: <b>{wallet['asset']}</b>\n"
       f"• Сеть: <b>{wallet['network']}</b>\n"
       f"• Реквизиты:\n<code>{wallet['address']}</code>\n\n"
