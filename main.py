@@ -77,7 +77,7 @@ BANNER_CACHE = {}
 PENDING_BILLS = {}
 
 # Активные треды / обращения и отслеживание шагов клиентов
-ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task, "expires_at": datetime.datetime, "closed": bool}
+ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task, "expires_at": datetime.datetime, "closed": bool, "kind": str, "context_label": str}
 CLIENT_JOURNEY = {}  # user_id -> {"max_step": str, "step_rank": int, "service_name": str, "price": float|int, "target": str, "updated_at": str}
 UNPAID_FOLLOWUP_TASKS = {}  # user_id -> asyncio.Task
 CLOSED_TICKETS = set()  # (client_id, ticket_kind)
@@ -385,6 +385,9 @@ async def load_persistent_state(bot: Bot | None = None):
   if bot:
     now = datetime.datetime.now()
     for uid, remind_at_str in reminders_data:
+      if await is_user_banned(uid, USER_MAPPING.get(uid)):
+        await delete_abandoned_reminder_db(uid)
+        continue
       try:
         remind_at = datetime.datetime.fromisoformat(remind_at_str)
         delay = max(0.0, (remind_at - now).total_seconds())
@@ -404,6 +407,9 @@ async def save_user_to_db(user):
   now_dt = datetime.datetime.now()
   now_iso = now_dt.isoformat()
   KNOWN_USERS[user.id] = now_dt
+  USER_MAPPING[user.id] = user.username
+  if user.username:
+    USER_MAPPING[user.username.lower().lstrip("@")] = user.id
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
       await conn.execute(
@@ -531,8 +537,7 @@ async def add_order_to_db(
     return cursor.lastrowid
 
 
-async def set_user_orders_in_work_db(user_id: int) -> tuple[int, list[str]]:
-  new_status = "⚙️ В работе"
+async def set_user_orders_status_db(user_id: int, new_status: str) -> tuple[int, list[str]]:
   service_names: list[str] = []
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
@@ -563,6 +568,14 @@ async def set_user_orders_in_work_db(user_id: int) -> tuple[int, list[str]]:
       )
       conn.commit()
       return cursor.rowcount, service_names
+
+
+async def set_user_orders_in_work_db(user_id: int) -> tuple[int, list[str]]:
+  return await set_user_orders_status_db(user_id, "⚙️ В работе")
+
+
+async def set_user_orders_completed_db(user_id: int) -> tuple[int, list[str]]:
+  return await set_user_orders_status_db(user_id, "✅ Выполнен")
 
 
 async def get_user_orders_from_db(user_id: int):
@@ -838,7 +851,14 @@ def _format_price(amount: float | int) -> str:
   return str(amount)
 
 
-# === ПРОВЕРКА ЗАПРЕЩЁННЫХ РЕКВИЗИТОВ ДЛЯ МЕНЕДЖЕРА (/send и /bill) ===
+async def _reset_staff_reply_state_if_needed(dp_or_bot, staff_id: int, state: FSMContext | None = None):
+  if state is not None:
+    cur_state = await state.get_state()
+    if cur_state == StaffQuickReplyForm.waiting_reply.state:
+      await state.clear()
+
+
+# === ПРОВЕРКА ЗАПРЕЩЁННЫХ РЕКВИЗИТОВ И ССЫЛОК ДЛЯ МЕНЕДЖЕРА (/send и /bill) ===
 _WALLET_PATTERNS = [
     r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b",  # TRON / TRC-20
     r"\b0x[a-fA-F0-9]{40}\b",  # EVM (BEP-20 / ERC-20)
@@ -849,22 +869,41 @@ _WALLET_PATTERNS = [
 ]
 _CARD_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
 _PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{7,16}\d)(?!\w)")
+_LINK_PATTERN = re.compile(
+    r"(?:https?://|www\.|t\.me/|telegram\.me/|telegra\.ph/|[a-zA-Z0-9.-]+\.(?:ru|com|net|org|io|me|cc|to|gg|pro|info|biz|xyz|shop|site|online|store|рф)(?:/|\b))",
+    re.IGNORECASE,
+)
+
+
+def _normalize_text_for_requisite_check(text: str) -> str:
+  # Убираем лишние пробелы и частые разделители между символами (точки, дефисы, слэши, подчёркивания, скобки)
+  cleaned = re.sub(r"[\s.\-_/\\|•·∙:;,()\[\]{}]+", "", text)
+  return cleaned
 
 
 def _check_manager_forbidden_requisites(text: str) -> str | None:
-  """Проверяет текст на номера карт, номера телефонов и адреса криптокошельков.
-  Названия банков и обычный текст разрешены."""
+  """Проверяет текст на ссылки, номера карт, номера телефонов и адреса криптокошельков
+  (в том числе при разбивке пробелами и разделителями)."""
   if not text:
     return None
 
+  if _LINK_PATTERN.search(text):
+    return "отправка ссылок запрещена"
+
+  compact = _normalize_text_for_requisite_check(text)
+
   for pattern in _WALLET_PATTERNS:
-    if re.search(pattern, text):
+    if re.search(pattern, text) or re.search(pattern, compact):
       return "обнаружен адрес криптокошелька"
 
   for m in _CARD_PATTERN.finditer(text):
     digits = re.sub(r"\D", "", m.group(0))
     if 13 <= len(digits) <= 19:
       return "обнаружен номер карты"
+
+  # Проверка сплошных/разделённых цифр карты (13-19 цифр)
+  for m in re.finditer(r"(?<!\d)\d{13,19}(?!\d)", compact):
+    return "обнаружен номер карты"
 
   for m in _PHONE_PATTERN.finditer(text):
     start, end = m.span()
@@ -875,28 +914,77 @@ def _check_manager_forbidden_requisites(text: str) -> str | None:
     if 10 <= len(digits) <= 15:
       return "обнаружен номер телефона"
 
+  # Проверка телефонных номеров с + или скобками/разделителями в компактном виде
+  for m in re.finditer(r"\+?\d{10,15}", compact):
+    candidate = m.group(0)
+    digits = re.sub(r"\D", "", candidate)
+    if 10 <= len(digits) <= 15:
+      # Исключаем короткие ID в явном виде, оставляем вероятные номера телефонов
+      if candidate.startswith("+") or len(digits) >= 11:
+        return "обнаружен номер телефона"
+
   return None
 
 
+# === ПОЛНОЕ ОТКЛЮЧЕНИЕ ЛЮБОЙ ОБРАБОТКИ ПРИ БАНЕ ===
+async def purge_banned_user_activity(user_id: int, username: str | None = None):
+  if username:
+    USER_MAPPING.pop(username.lower().lstrip("@"), None)
+  KNOWN_USERS.pop(user_id, None)
+  LAST_BROADCAST.pop(user_id, None)
+  CLIENT_JOURNEY.pop(user_id, None)
+  PENDING_BILLS.pop(user_id, None)
+  await delete_pending_bill_db(user_id)
+  await delete_abandoned_reminder_db(user_id)
+
+  rem_task = ABANDONED_CHECKOUTS.pop(user_id, None)
+  if rem_task:
+    rem_task.cancel()
+
+  followup_task = UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
+  if followup_task:
+    followup_task.cancel()
+
+  thread = ACTIVE_SEND_THREADS.pop(user_id, None)
+  if thread and thread.get("task"):
+    thread["task"].cancel()
+
+  for k in [key for key in CLOSED_TICKETS if key[0] == user_id]:
+    CLOSED_TICKETS.discard(k)
+
+
 # === ОТСЛЕЖИВАНИЕ ШАГОВ КЛИЕНТА И НЕОПЛАЧЕННЫХ ЗАКАЗОВ ===
+async def _has_current_unpaid_order(user_id: int) -> bool:
+  if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+    return False
+  if user_id in PENDING_BILLS:
+    return True
+  journey = CLIENT_JOURNEY.get(user_id)
+  if journey and journey.get("step_rank", 0) >= STEP_RANK["summary"]:
+    return True
+  return False
+
+
 async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 900.0):
   try:
     if delay_seconds > 0:
       await asyncio.sleep(delay_seconds)
     UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
 
-    # Проверяем, не оплатил ли уже клиент
-    orders = await get_user_orders_from_db(user_id)
-    if orders:
+    if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+      await purge_banned_user_activity(user_id, USER_MAPPING.get(user_id))
       return
 
-    journey = CLIENT_JOURNEY.get(user_id)
-    if not journey or journey.get("step_rank", 0) < STEP_RANK["summary"]:
+    if not await _has_current_unpaid_order(user_id):
       return
+
+    journey = CLIENT_JOURNEY.get(user_id) or {}
+    bill = PENDING_BILLS.get(user_id)
+    step_label = journey.get("step_label") or ("Выставлен счёт" if bill else "Этап оплаты")
 
     summary_card = _build_client_journey_summary(user_id)
     msg_text = (
-        f"⚠️ <b>Неоплаченный заказ (клиент остановился на этапе: {journey.get('step_label')})</b>\n\n"
+        f"⚠️ <b>Неоплаченный заказ (клиент остановился на этапе: {step_label})</b>\n\n"
         f"{summary_card}\n\n"
         f"💡 Проведите клиента дальше: напишите ему или отмените/закройте лид."
     )
@@ -937,20 +1025,27 @@ async def track_client_step(
     service_name: str | None = None,
     price: float | int | None = None,
     target: str | None = None,
+    force_current_step: bool = False,
 ):
   if not user:
     return
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+
   uid = user.id
   rank = STEP_RANK.get(step_key, 0)
   prev = CLIENT_JOURNEY.get(uid) or {}
   max_rank = max(prev.get("step_rank", 0), rank)
   max_step_key = step_key if rank >= prev.get("step_rank", 0) else prev.get("max_step", step_key)
 
+  cur_step_key = step_key if force_current_step else (step_key if rank >= prev.get("step_rank", 0) else prev.get("step", step_key))
+
   CLIENT_JOURNEY[uid] = {
       "user_id": uid,
       "username": user.username or prev.get("username"),
-      "step": step_key,
-      "step_label": STEP_LABELS.get(step_key, step_key),
+      "step": cur_step_key,
+      "step_label": STEP_LABELS.get(cur_step_key, cur_step_key),
       "max_step": max_step_key,
       "max_step_label": STEP_LABELS.get(max_step_key, max_step_key),
       "step_rank": max_rank,
@@ -960,12 +1055,32 @@ async def track_client_step(
       "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
   }
 
-  if rank >= STEP_RANK["summary"]:
+  if rank >= STEP_RANK["summary"] or uid in PENDING_BILLS:
     _schedule_unpaid_followup(bot, uid, delay_seconds=900.0)
+
+
+def _get_latest_order_status(user_id: int) -> str:
+  try:
+    with sqlite3.connect("bot_database.db") as conn:
+      row = conn.execute(
+          "SELECT status FROM orders WHERE user_id = ? ORDER BY id DESC LIMIT 1",
+          (user_id,),
+      ).fetchone()
+      if row and row[0]:
+        return str(row[0])
+  except Exception:
+    pass
+  if user_id in PENDING_BILLS:
+    return "🧾 Выставлен счёт (ожидает оплаты)"
+  j = CLIENT_JOURNEY.get(user_id) or {}
+  if j.get("step_rank", 0) >= STEP_RANK["summary"]:
+    return "⏳ Не оплачен"
+  return "—"
 
 
 def _build_client_journey_summary(user_id: int) -> str:
   j = CLIENT_JOURNEY.get(user_id) or {}
+  bill = PENDING_BILLS.get(user_id) or {}
   orders_count = 0
   try:
     with sqlite3.connect("bot_database.db") as conn:
@@ -976,22 +1091,23 @@ def _build_client_journey_summary(user_id: int) -> str:
     pass
 
   badge = _format_user_badge(user_id, j.get("username"))
-  price_val = j.get("price", 0)
+  price_val = bill.get("total_price") if bill.get("total_price") is not None else j.get("price", 0)
   price_str = f"{_format_price(price_val)}$" if price_val else "По расчёту"
-  max_label = j.get("max_step_label") or "Вход в бота"
+  max_label = j.get("max_step_label") or ("Выставлен счёт" if bill else "Вход в бота")
   cur_label = j.get("step_label") or max_label
-  srv = j.get("service_name") or "—"
-  tgt = j.get("target") or "—"
+  srv = bill.get("service_name") or j.get("service_name") or "—"
+  tgt = j.get("target") or bill.get("target_username") or "—"
+  order_status = _get_latest_order_status(user_id)
   upd = j.get("updated_at") or datetime.datetime.now().strftime("%d.%m %H:%M")
 
   return (
-      f"📊 <b>Сводка по клиенту:</b>\n"
+      f"📊 <b>Сводка по клиенту и заказу:</b>\n"
       f"• Клиент: {badge}\n"
       f"• ID: <code>{user_id}</code>\n"
-      f"• Выбранная услуга: <b>{srv}</b> ({price_str})\n"
-      f"• Цель / детали: <b>{tgt}</b>\n"
-      f"• Текущий этап: <b>{cur_label}</b>\n"
-      f"• Максимум дошёл до: <b>{max_label}</b>\n"
+      f"• Услуга: <b>{srv}</b> ({price_str})\n"
+      f"• Данные цели / детали особого заказа: <b>{tgt}</b>\n"
+      f"• Текущий этап: <b>{cur_label}</b> (макс.: <b>{max_label}</b>)\n"
+      f"• Статус заказа: <b>{order_status}</b>\n"
       f"• Заказов в истории: <b>{orders_count}</b>\n"
       f"• Обновлено: <i>{upd}</i>"
   )
@@ -1007,18 +1123,18 @@ def _client_send_thread_keyboard(client_id: int) -> InlineKeyboardMarkup:
   )
 
 
-def _staff_ticket_keyboard(client_id: int, ticket_kind: str) -> InlineKeyboardMarkup:
+def _staff_payment_problem_keyboard(client_id: int) -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text="💬 Ответить",
-                  callback_data=f"staff_ans_ticket_{ticket_kind}_{client_id}",
+                  text="✍️ Написать клиенту",
+                  callback_data=f"staff_ans_ticket_payment_{client_id}",
                   style="primary",
               ),
               InlineKeyboardButton(
                   text="🔒 Закрыть обращение",
-                  callback_data=f"staff_close_ticket_{ticket_kind}_{client_id}",
+                  callback_data=f"staff_close_ticket_payment_{client_id}",
                   style="danger",
               ),
           ]
@@ -1026,23 +1142,83 @@ def _staff_ticket_keyboard(client_id: int, ticket_kind: str) -> InlineKeyboardMa
   )
 
 
-def _staff_paid_order_keyboard(client_id: int) -> InlineKeyboardMarkup:
+def _staff_support_ticket_keyboard(client_id: int) -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
           [
               InlineKeyboardButton(
-                  text="✍️ Написать клиенту",
-                  callback_data=f"staff_ans_ticket_order_{client_id}",
+                  text="💬 Ответить клиенту",
+                  callback_data=f"staff_ans_ticket_support_{client_id}",
                   style="primary",
               ),
               InlineKeyboardButton(
-                  text="⚙️ В работе",
-                  callback_data=f"staff_set_work_{client_id}",
+                  text="🧾 Выставить счёт",
+                  callback_data=f"staff_bill_ticket_support_{client_id}",
                   style="success",
               ),
-          ]
+          ],
+          [
+              InlineKeyboardButton(
+                  text="🔒 Закрыть обращение",
+                  callback_data=f"staff_close_ticket_support_{client_id}",
+                  style="danger",
+              ),
+          ],
       ]
   )
+
+
+def _staff_order_and_special_keyboard(client_id: int, ticket_kind: str = "order") -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="💬 Ответить клиенту",
+                  callback_data=f"staff_ans_ticket_{ticket_kind}_{client_id}",
+                  style="primary",
+              ),
+              InlineKeyboardButton(
+                  text="🧾 Выставить счёт",
+                  callback_data=f"staff_bill_ticket_{ticket_kind}_{client_id}",
+                  style="primary",
+              ),
+          ],
+          [
+              InlineKeyboardButton(
+                  text="✉️+🧾 Ответить и выставить счёт",
+                  callback_data=f"staff_both_ticket_{ticket_kind}_{client_id}",
+                  style="success",
+              ),
+          ],
+          [
+              InlineKeyboardButton(
+                  text="⚙️ В работе",
+                  callback_data=f"staff_set_work_{client_id}",
+                  style="primary",
+              ),
+              InlineKeyboardButton(
+                  text="✅ Выполнен",
+                  callback_data=f"staff_set_done_{client_id}",
+                  style="success",
+              ),
+          ],
+          [
+              InlineKeyboardButton(
+                  text="🔒 Закрыть обращение",
+                  callback_data=f"staff_close_ticket_{ticket_kind}_{client_id}",
+                  style="danger",
+              ),
+          ],
+      ]
+  )
+
+
+def _staff_ticket_keyboard(client_id: int, ticket_kind: str) -> InlineKeyboardMarkup:
+  if ticket_kind == "payment":
+    return _staff_payment_problem_keyboard(client_id)
+  if ticket_kind == "support":
+    return _staff_support_ticket_keyboard(client_id)
+  return _staff_order_and_special_keyboard(client_id, ticket_kind=ticket_kind)
 
 
 async def _auto_close_send_thread(bot: Bot, client_id: int, delay_seconds: float = 3600.0):
@@ -1053,6 +1229,8 @@ async def _auto_close_send_thread(bot: Bot, client_id: int, delay_seconds: float
       return
     thread["closed"] = True
     ACTIVE_SEND_THREADS.pop(client_id, None)
+    if await is_user_banned(client_id, USER_MAPPING.get(client_id)):
+      return
     try:
       await bot.send_message(
           chat_id=client_id,
@@ -1065,7 +1243,9 @@ async def _auto_close_send_thread(bot: Bot, client_id: int, delay_seconds: float
     pass
 
 
-async def _activate_send_thread(bot: Bot, client_id: int):
+async def _activate_send_thread(bot: Bot, client_id: int, kind: str = "send", context_label: str = ""):
+  if await is_user_banned(client_id, USER_MAPPING.get(client_id)):
+    return
   old = ACTIVE_SEND_THREADS.pop(client_id, None)
   if old and old.get("task"):
     old["task"].cancel()
@@ -1075,6 +1255,8 @@ async def _activate_send_thread(bot: Bot, client_id: int):
       "task": task,
       "expires_at": expires_at,
       "closed": False,
+      "kind": kind,
+      "context_label": context_label,
   }
 
 
@@ -1082,7 +1264,7 @@ async def _close_send_thread(bot: Bot, client_id: int, notify_client: bool = Fal
   thread = ACTIVE_SEND_THREADS.pop(client_id, None)
   if thread and thread.get("task"):
     thread["task"].cancel()
-  if notify_client:
+  if notify_client and not await is_user_banned(client_id, USER_MAPPING.get(client_id)):
     try:
       await bot.send_message(
           chat_id=client_id,
@@ -1095,6 +1277,8 @@ async def _close_send_thread(bot: Bot, client_id: int, notify_client: bool = Fal
 
 async def _deliver_to_client_safely(bot: Bot, target_user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None):
   """Надёжная доставка сообщения клиенту с учётом кэша и повторной попыткой при сбое."""
+  if await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+    raise ValueError("Пользователь заблокирован.")
   if target_user_id not in KNOWN_USERS:
     KNOWN_USERS[target_user_id] = datetime.datetime.now()
   try:
@@ -1167,7 +1351,7 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
           [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
           [InlineKeyboardButton(text="🪙 Реквизиты (Крипта)", callback_data="crypto_expert", style="danger")],
           [InlineKeyboardButton(text="💬 Нужна помощь", callback_data="payment_help_manager", style="primary")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_payment", style="danger")],
       ]
   )
 
@@ -1179,6 +1363,7 @@ async def ban_middleware(handler, event, data):
     if is_admin_authorized(event.from_user.id) and event.text and event.text.strip().startswith("/unban"):
       return await handler(event, data)
     if await is_user_banned(event.from_user.id, event.from_user.username):
+      await purge_banned_user_activity(event.from_user.id, event.from_user.username)
       return
   return await handler(event, data)
 
@@ -1186,12 +1371,16 @@ async def ban_middleware(handler, event, data):
 @router.callback_query.middleware()
 async def ban_callback_middleware(handler, event, data):
   if event.from_user and await is_user_banned(event.from_user.id, event.from_user.username):
+    await purge_banned_user_activity(event.from_user.id, event.from_user.username)
     return
   return await handler(event, data)
 
 
 async def track_user(user):
   if user:
+    if await is_user_banned(user.id, user.username):
+      await purge_banned_user_activity(user.id, user.username)
+      return
     USER_MAPPING[user.id] = user.username
     if user.username:
       USER_MAPPING[user.username.lower().lstrip("@")] = user.id
@@ -1456,7 +1645,11 @@ async def render_step(
 
 # === ГЛАВНОЕ МЕНЮ ===
 async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  bot_msg_id = data.get("bot_msg_id")
   await state.clear()
+  if bot_msg_id:
+    await state.update_data(bot_msg_id=bot_msg_id)
   user_id = event.from_user.id
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
@@ -1479,45 +1672,55 @@ async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
   await render_step(event, state, "main.jpg", text, keyboard)
 
 
-# === АДМИНСКИЕ И МЕНЕДЖЕРСКИЕ КОМАНДЫ ===
-@router.message(Command("bill"))
-async def cmd_manager_bill(message: Message):
-  if not is_manager_authorized(message.from_user.id):
-    return
-  args = message.text.split(maxsplit=1)
-  if len(args) < 2:
-    await message.reply(
-        "❌ Использование: `/bill <user_id или @username> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`",
-        parse_mode="Markdown",
-    )
-    return
+# === ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ВЫСТАВЛЕНИЯ СЧЁТА И ОТПРАВКИ СООБЩЕНИЯ ===
+def _parse_bill_payload(raw_text: str, default_client_id: int | None = None):
+  """Парсит строку вида '<услуга> <сумма$>' или '<user_id> <услуга> <сумма$>'."""
+  parts = raw_text.strip().split()
+  if not parts:
+    return None, None, None
+  if default_client_id is None:
+    if len(parts) < 2:
+      return None, None, None
+    target_user_id = _resolve_user_target(parts[0])
+    rest_parts = parts[1:]
+  else:
+    target_user_id = default_client_id
+    rest_parts = parts
 
-  parts = args[1].strip().split()
-  if len(parts) < 2:
-    await message.reply("❌ Неверный формат. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
-    return
+  if not target_user_id or len(rest_parts) < 2:
+    return None, None, None
 
-  target_user_id = _resolve_user_target(parts[0])
-  if not target_user_id:
-    await message.reply("❌ Неверный ID или @username пользователя.")
-    return
-
-  raw_amount = parts[-1].rstrip("$").strip()
+  raw_amount = rest_parts[-1].rstrip("$").strip()
   try:
     amount = float(raw_amount)
   except ValueError:
-    await message.reply("❌ Неверная сумма. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
-    return
+    return None, None, None
 
-  service_name = " ".join(parts[1:-1]).strip() if len(parts) > 2 else "Особый заказ"
+  service_name = " ".join(rest_parts[:-1]).strip()
   if not service_name:
     service_name = "Особый заказ"
+  return target_user_id, service_name, amount
 
-  if is_pure_manager(message.from_user.id):
+
+async def _issue_bill_to_client(
+    bot: Bot,
+    staff_id: int,
+    target_user_id: int,
+    service_name: str,
+    amount: float,
+    message_prefix: str | None = None,
+) -> tuple[bool, str]:
+  if await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+    return False, "Пользователь заблокирован."
+
+  if is_pure_manager(staff_id):
     forbidden_reason = _check_manager_forbidden_requisites(service_name)
     if forbidden_reason:
-      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
-      return
+      return False, f"Отправка запрещена: {forbidden_reason}."
+    if message_prefix:
+      forbidden_prefix_reason = _check_manager_forbidden_requisites(message_prefix)
+      if forbidden_prefix_reason:
+        return False, f"Отправка запрещена: {forbidden_prefix_reason}."
 
   bill_obj = {
       "service_name": service_name,
@@ -1526,33 +1729,65 @@ async def cmd_manager_bill(message: Message):
   }
   PENDING_BILLS[target_user_id] = bill_obj
   await save_pending_bill_db(target_user_id, bill_obj)
+  _schedule_unpaid_followup(bot, target_user_id, delay_seconds=900.0)
 
   price_str = _format_price(amount)
+  prefix_block = f"💬 <b>Сообщение от менеджера:</b>\n{message_prefix}\n\n" if message_prefix else ""
   bill_text = (
+      f"{prefix_block}"
       f"🧾 <b>Вам выставлен счет на {service_name}</b>\n\n"
       f"• Услуга: <b>{service_name}</b>\n"
       f"• К оплате: <b>{price_str}$</b>\n\n"
       f"Выберите способ оплаты ниже, чтобы получить реквизиты:"
   )
-  try:
-    await _deliver_to_client_safely(
-        message.bot,
-        target_user_id=target_user_id,
-        text=bill_text,
-        reply_markup=_build_payment_keyboard(),
-    )
+  await _activate_send_thread(bot, target_user_id, kind="bill", context_label=f"{service_name} ({price_str}$)")
+  await _deliver_to_client_safely(
+      bot,
+      target_user_id=target_user_id,
+      text=bill_text,
+      reply_markup=_build_payment_keyboard(),
+  )
+  return True, f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>."
+
+
+# === АДМИНСКИЕ И МЕНЕДЖЕРСКИЕ КОМАНДЫ ===
+@router.message(Command("bill"))
+async def cmd_manager_bill(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
+
+  args = message.text.split(maxsplit=1)
+  if len(args) < 2:
     await message.reply(
-        f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>.",
-        parse_mode="HTML",
+        "❌ Использование: `/bill <user_id или @username> <услуга> <сумма$>`\nПример: `/bill 282810030 особый заказ 220$`",
+        parse_mode="Markdown",
     )
+    return
+
+  target_user_id, service_name, amount = _parse_bill_payload(args[1], default_client_id=None)
+  if not target_user_id or service_name is None or amount is None:
+    await message.reply("❌ Неверный формат. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
+    return
+
+  try:
+    ok, status_msg = await _issue_bill_to_client(
+        message.bot, message.from_user.id, target_user_id, service_name, amount
+    )
+    if not ok:
+      await message.reply(f"❌ {status_msg}")
+      return
+    await message.reply(status_msg, parse_mode="HTML")
   except Exception as e:
     await message.reply(f"❌ Не удалось отправить счет пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
 
 
 @router.message(Command("send"))
-async def cmd_manager_send(message: Message):
+async def cmd_manager_send(message: Message, state: FSMContext):
   if not is_manager_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
+
   args = message.text.split(maxsplit=2)
   if len(args) < 3:
     await message.reply(
@@ -1564,6 +1799,10 @@ async def cmd_manager_send(message: Message):
   target_user_id = _resolve_user_target(args[1].strip())
   if not target_user_id:
     await message.reply("❌ Неверный ID или @username пользователя.")
+    return
+
+  if await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+    await message.reply("❌ Пользователь заблокирован.")
     return
 
   out_text = args[2].strip()
@@ -1578,7 +1817,7 @@ async def cmd_manager_send(message: Message):
       return
 
   try:
-    await _activate_send_thread(message.bot, target_user_id)
+    await _activate_send_thread(message.bot, target_user_id, kind="send", context_label="Сообщение менеджера")
     await _deliver_to_client_safely(
         message.bot,
         target_user_id=target_user_id,
@@ -1588,6 +1827,101 @@ async def cmd_manager_send(message: Message):
     await message.reply(f"✅ Сообщение отправлено пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
   except Exception as e:
     await message.reply(f"❌ Ошибка отправки пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
+
+
+@router.message(Command("roll"))
+async def cmd_roll_funnel(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
+
+  all_uids = set(CLIENT_JOURNEY.keys()) | set(PENDING_BILLS.keys()) | set(KNOWN_USERS.keys())
+  active_entries = []
+  for uid in sorted(all_uids):
+    if await is_user_banned(uid, USER_MAPPING.get(uid)):
+      continue
+    j = CLIENT_JOURNEY.get(uid) or {}
+    bill = PENDING_BILLS.get(uid) or {}
+    orders = await get_user_orders_from_db(uid)
+    order_status = orders[0]["status"] if orders else _get_latest_order_status(uid)
+    service_name = bill.get("service_name") or j.get("service_name") or "—"
+    price_val = bill.get("total_price") if bill.get("total_price") is not None else j.get("price", 0)
+    price_str = f"{_format_price(price_val)}$" if price_val else "По расчёту"
+    target_val = j.get("target") or bill.get("target_username") or "—"
+    step_label = j.get("step_label") or ("Выставлен счёт" if bill else "Вход в бота")
+    badge = _format_user_badge(uid, j.get("username"))
+    active_entries.append(
+        f"• {badge}\n"
+        f"  Этап: <b>{step_label}</b> | Услуга: <b>{service_name}</b> ({price_str})\n"
+        f"  Данные: <b>{target_val}</b> | Статус заказа: <b>{order_status}</b>"
+    )
+
+  if not active_entries:
+    await message.reply("📉 <b>Активность и воронка (/roll):</b>\n\nНет активных записей клиентов.", parse_mode="HTML")
+    return
+
+  header = "📈 <b>Активность и воронка клиентов (/roll):</b>\n\n"
+  chunk = header
+  for entry in active_entries:
+    if len(chunk) + len(entry) + 2 > 3900:
+      await message.reply(chunk, parse_mode="HTML")
+      chunk = entry + "\n\n"
+    else:
+      chunk += entry + "\n\n"
+  if chunk.strip():
+    await message.reply(chunk.strip(), parse_mode="HTML")
+
+
+@router.message(Command("aid"))
+async def cmd_aid_problem_clients(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
+
+  problem_uids = set()
+  for uid, thr in ACTIVE_SEND_THREADS.items():
+    if not thr.get("closed"):
+      problem_uids.add(uid)
+  for uid, j in CLIENT_JOURNEY.items():
+    srv_l = (j.get("service_name") or "").lower()
+    step_k = j.get("step") or ""
+    if "особый" in srv_l or step_k in {"payment_menu", "payment_method_selected", "receipt_requested"}:
+      problem_uids.add(uid)
+  for uid in PENDING_BILLS.keys():
+    problem_uids.add(uid)
+
+  items = []
+  for uid in sorted(problem_uids):
+    if await is_user_banned(uid, USER_MAPPING.get(uid)):
+      continue
+    j = CLIENT_JOURNEY.get(uid) or {}
+    bill = PENDING_BILLS.get(uid) or {}
+    thr = ACTIVE_SEND_THREADS.get(uid) or {}
+    badge = _format_user_badge(uid, j.get("username"))
+    srv = bill.get("service_name") or j.get("service_name") or "—"
+    step_label = j.get("step_label") or ("Выставлен счёт" if bill else "Обращение")
+    data_val = j.get("target") or bill.get("target_username") or "—"
+    req_label = thr.get("context_label") or ("Особый заказ / оплата / поддержка")
+    items.append(
+        f"🚨 {badge}\n"
+        f"  Этап: <b>{step_label}</b> | Запрос: <b>{req_label}</b>\n"
+        f"  Услуга: <b>{srv}</b> | Данные: <b>{data_val}</b>"
+    )
+
+  if not items:
+    await message.reply("✅ <b>Проблемные клиенты (/aid):</b>\n\nСейчас нет активных обращений, особых заказов или проблем с оплатой.", parse_mode="HTML")
+    return
+
+  header = "🚨 <b>Проблемные клиенты — особый заказ / оплата / поддержка (/aid):</b>\n\n"
+  chunk = header
+  for item in items:
+    if len(chunk) + len(item) + 2 > 3900:
+      await message.reply(chunk, parse_mode="HTML")
+      chunk = item + "\n\n"
+    else:
+      chunk += item + "\n\n"
+  if chunk.strip():
+    await message.reply(chunk.strip(), parse_mode="HTML")
 
 
 # === КНОПКИ КЛИЕНТА ПОД СООБЩЕНИЕМ МЕНЕДЖЕРА И БЕСКОНЕЧНАЯ ЦЕПОЧКА ===
@@ -1631,16 +1965,23 @@ async def process_client_thread_reply(message: Message, state: FSMContext):
     return
 
   # Продлеваем таймер автозакрытия на 1 час при активности клиента
-  await _activate_send_thread(message.bot, client_id)
+  await _activate_send_thread(
+      message.bot,
+      client_id,
+      kind=thread.get("kind", "send"),
+      context_label=thread.get("context_label", "Переписка с клиентом"),
+  )
 
   user_badge = _format_user_badge(client_id, message.from_user.username)
   body_text = (message.caption or message.text or "").strip()
+  summary_block = _build_client_journey_summary(client_id)
   header = (
       f"📩 <b>Ответ клиента</b>\n"
       f"• От кого: {user_badge}\n"
-      f"• Сообщение: {body_text if body_text else '<i>[Фото]</i>'}"
+      f"• Сообщение: {body_text if body_text else '<i>[Фото]</i>'}\n\n"
+      f"{summary_block}"
   )
-  staff_kb = _staff_ticket_keyboard(client_id, "send")
+  staff_kb = _staff_order_and_special_keyboard(client_id, ticket_kind=thread.get("kind", "order"))
 
   for uid in _get_staff_notify_ids():
     try:
@@ -1663,7 +2004,10 @@ async def process_client_thread_reply(message: Message, state: FSMContext):
       logger.warning(f"Не удалось переслать ответ клиента ({uid}): {e}")
 
   await state.clear()
-  await message.reply("✅ Ваше сообщение отправлено менеджеру.")
+  await message.reply(
+      "✅ Ваше сообщение отправлено менеджеру.",
+      reply_markup=_client_send_thread_keyboard(client_id),
+  )
 
 
 @router.callback_query(F.data.startswith("client_close_thr_"))
@@ -1692,12 +2036,44 @@ async def cb_client_close_send_thread(callback: CallbackQuery, state: FSMContext
 
 
 # === МЕНЮ ТИКЕТОВ У МЕНЕДЖЕРА / АДМИНА (ПОДДЕРЖКА / ОСОБЫЙ ЗАКАЗ / ОПЛАТА / ЗАКАЗЫ) ===
+def _staff_cancel_mode_keyboard() -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="❌ Отмена", callback_data="staff_cancel_mode", style="danger")]
+      ]
+  )
+
+
+def _staff_guide_and_cheatsheet(client_id: int, mode_label: str) -> str:
+  return (
+      f"✍️ <b>Режим: {mode_label}</b> для клиента <code>{client_id}</code>\n\n"
+      f"📌 <b>Как заполнить:</b>\n"
+      f"• <i>Для ответа:</i> напишите текст сообщения одним сообщением.\n"
+      f"• <i>Для счёта:</i> укажите услугу и сумму в долларах, например: <code>особый заказ 220$</code>.\n"
+      f"• <i>Для ответа и счёта вместе:</i> укажите <code>текст сообщения | услуга 220$</code> (или отдельной строкой <code>счёт: услуга 220$</code>).\n\n"
+      f"🛠 <b>Шпаргалка команд (на случай ручного ввода):</b>\n"
+      f"• Сообщение: <code>/send {client_id} Ваш текст</code>\n"
+      f"• Счёт: <code>/bill {client_id} особый заказ 220$</code>"
+  )
+
+
+@router.callback_query(F.data == "staff_cancel_mode")
+async def cb_staff_cancel_mode(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  await state.clear()
+  await callback.answer("Режим сброшен.")
+  try:
+    await callback.message.edit_text("❌ Режим ввода отменён.")
+  except Exception:
+    await callback.message.reply("❌ Режим ввода отменён.")
+
+
 @router.callback_query(F.data.startswith("staff_ans_ticket_"))
 async def cb_staff_answer_ticket(callback: CallbackQuery, state: FSMContext):
   if not is_manager_authorized(callback.from_user.id):
     return
   parts = callback.data.split("_")
-  # формат: staff_ans_ticket_{kind}_{client_id}
   if len(parts) < 5:
     return
   kind = parts[3]
@@ -1708,9 +2084,56 @@ async def cb_staff_answer_ticket(callback: CallbackQuery, state: FSMContext):
 
   await callback.answer()
   await state.set_state(StaffQuickReplyForm.waiting_reply)
-  await state.update_data(target_client_id=client_id, ticket_kind=kind)
+  await state.update_data(target_client_id=client_id, ticket_kind=kind, staff_action="reply")
   await callback.message.reply(
-      f"✍️ Введите ответ клиенту <code>{client_id}</code> одним сообщением (или отправьте /cancel для отмены):",
+      _staff_guide_and_cheatsheet(client_id, "Ответ клиенту"),
+      reply_markup=_staff_cancel_mode_keyboard(),
+      parse_mode="HTML",
+  )
+
+
+@router.callback_query(F.data.startswith("staff_bill_ticket_"))
+async def cb_staff_bill_ticket(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  parts = callback.data.split("_")
+  if len(parts) < 5:
+    return
+  kind = parts[3]
+  try:
+    client_id = int(parts[4])
+  except ValueError:
+    return
+
+  await callback.answer()
+  await state.set_state(StaffQuickReplyForm.waiting_reply)
+  await state.update_data(target_client_id=client_id, ticket_kind=kind, staff_action="bill")
+  await callback.message.reply(
+      _staff_guide_and_cheatsheet(client_id, "Выставить счёт"),
+      reply_markup=_staff_cancel_mode_keyboard(),
+      parse_mode="HTML",
+  )
+
+
+@router.callback_query(F.data.startswith("staff_both_ticket_"))
+async def cb_staff_both_ticket(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  parts = callback.data.split("_")
+  if len(parts) < 5:
+    return
+  kind = parts[3]
+  try:
+    client_id = int(parts[4])
+  except ValueError:
+    return
+
+  await callback.answer()
+  await state.set_state(StaffQuickReplyForm.waiting_reply)
+  await state.update_data(target_client_id=client_id, ticket_kind=kind, staff_action="both")
+  await callback.message.reply(
+      _staff_guide_and_cheatsheet(client_id, "Ответить и выставить счёт"),
+      reply_markup=_staff_cancel_mode_keyboard(),
       parse_mode="HTML",
   )
 
@@ -1730,13 +2153,84 @@ async def process_staff_quick_reply(message: Message, state: FSMContext):
   data = await state.get_data()
   target_client_id = data.get("target_client_id")
   kind = data.get("ticket_kind") or "support"
-  reply_text = message.text.strip()
+  action = data.get("staff_action") or "reply"
+  raw_text = message.text.strip()
 
   if not target_client_id:
     await state.clear()
     await message.reply("❌ Не найден ID клиента.")
     return
 
+  client_int_id = int(target_client_id)
+
+  if action == "bill":
+    _, service_name, amount = _parse_bill_payload(raw_text, default_client_id=client_int_id)
+    if service_name is None or amount is None:
+      await message.reply(
+          "❌ Не удалось распознать услугу и сумму. Пример: <code>особый заказ 220$</code>",
+          reply_markup=_staff_cancel_mode_keyboard(),
+          parse_mode="HTML",
+      )
+      return
+    try:
+      ok, status_msg = await _issue_bill_to_client(
+          message.bot, message.from_user.id, client_int_id, service_name, amount
+      )
+      if not ok:
+        await message.reply(f"❌ {status_msg}")
+        return
+      await state.clear()
+      await message.reply(status_msg, parse_mode="HTML")
+    except Exception as e:
+      await message.reply(f"❌ Ошибка выставления счёта клиенту <code>{client_int_id}</code>: {e}", parse_mode="HTML")
+    return
+
+  if action == "both":
+    # Поддерживаем формат "Текст сообщения | услуга 220$" или перенос строки с "счёт: услуга 220$"
+    msg_part = raw_text
+    bill_part = ""
+    if "|" in raw_text:
+      left, right = raw_text.split("|", 1)
+      msg_part = left.strip()
+      bill_part = right.strip()
+    else:
+      lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+      if len(lines) >= 2:
+        msg_part = "\n".join(lines[:-1]).strip()
+        bill_part = re.sub(r"^(?:сч[её]т|bill)\s*:\s*", "", lines[-1], flags=re.IGNORECASE).strip()
+
+    _, service_name, amount = _parse_bill_payload(bill_part, default_client_id=client_int_id)
+    if not msg_part or service_name is None or amount is None:
+      await message.reply(
+          "❌ Для совмещённой отправки укажите текст и счёт, например:\n"
+          "<code>Готовы взяться за задачу. | особый заказ 220$</code>",
+          reply_markup=_staff_cancel_mode_keyboard(),
+          parse_mode="HTML",
+      )
+      return
+    try:
+      ok, status_msg = await _issue_bill_to_client(
+          message.bot,
+          message.from_user.id,
+          client_int_id,
+          service_name,
+          amount,
+          message_prefix=msg_part,
+      )
+      if not ok:
+        await message.reply(f"❌ {status_msg}")
+        return
+      await state.clear()
+      await message.reply(
+          f"✅ Сообщение и счёт на <b>{service_name}</b> (<b>{_format_price(amount)}$</b>) отправлены клиенту <code>{client_int_id}</code>.",
+          parse_mode="HTML",
+      )
+    except Exception as e:
+      await message.reply(f"❌ Ошибка отправки клиенту <code>{client_int_id}</code>: {e}", parse_mode="HTML")
+    return
+
+  # Обычный ответ клиенту
+  reply_text = raw_text
   if is_pure_manager(message.from_user.id):
     forbidden_reason = _check_manager_forbidden_requisites(reply_text)
     if forbidden_reason:
@@ -1744,9 +2238,7 @@ async def process_staff_quick_reply(message: Message, state: FSMContext):
       return
 
   try:
-    client_int_id = int(target_client_id)
-    # Активируем/продлеваем тред (автозакрытие через 1 час у клиента, у менеджера висит бессрочно)
-    await _activate_send_thread(message.bot, client_int_id)
+    await _activate_send_thread(message.bot, client_int_id, kind=kind, context_label=f"Ответ ({kind})")
     await _deliver_to_client_safely(
         message.bot,
         target_user_id=client_int_id,
@@ -1756,15 +2248,15 @@ async def process_staff_quick_reply(message: Message, state: FSMContext):
     await state.clear()
     await message.reply(f"✅ Ответ отправлен клиенту <code>{client_int_id}</code>.", parse_mode="HTML")
   except Exception as e:
-    await message.reply(f"❌ Ошибка отправки клиенту <code>{target_client_id}</code>: {e}", parse_mode="HTML")
+    await message.reply(f"❌ Ошибка отправки клиенту <code>{client_int_id}</code>: {e}", parse_mode="HTML")
 
 
 @router.callback_query(F.data.startswith("staff_close_ticket_"))
-async def cb_staff_close_ticket(callback: CallbackQuery):
+async def cb_staff_close_ticket(callback: CallbackQuery, state: FSMContext):
   if not is_manager_authorized(callback.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(callback.bot, callback.from_user.id, state)
   parts = callback.data.split("_")
-  # формат: staff_close_ticket_{kind}_{client_id}
   if len(parts) < 5:
     return
   kind = parts[3]
@@ -1785,9 +2277,10 @@ async def cb_staff_close_ticket(callback: CallbackQuery):
 
 
 @router.callback_query(F.data.startswith("staff_set_work_"))
-async def cb_staff_set_order_in_work(callback: CallbackQuery):
+async def cb_staff_set_order_in_work(callback: CallbackQuery, state: FSMContext):
   if not is_manager_authorized(callback.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(callback.bot, callback.from_user.id, state)
   try:
     client_id = int(callback.data.split("_")[-1])
   except ValueError:
@@ -1799,22 +2292,60 @@ async def cb_staff_set_order_in_work(callback: CallbackQuery):
     return
 
   services_label = ", ".join(f"<b>{s}</b>" for s in service_names) if service_names else "<b>ваш заказ</b>"
-  try:
-    await callback.bot.send_message(
-        chat_id=client_id,
-        text=f"⚙️ Ваш заказ {services_label} переведён в статус: <b>В работе</b>.",
-        parse_mode="HTML",
-    )
-  except Exception as e:
-    logger.warning(f"Не удалось уведомить клиента {client_id} о статусе 'В работе': {e}")
+  if not await is_user_banned(client_id, USER_MAPPING.get(client_id)):
+    try:
+      await callback.bot.send_message(
+          chat_id=client_id,
+          text=f"⚙️ Ваш заказ {services_label} переведён в статус: <b>В работе</b>.",
+          parse_mode="HTML",
+      )
+    except Exception as e:
+      logger.warning(f"Не удалось уведомить клиента {client_id} о статусе 'В работе': {e}")
 
   await callback.answer("Статус обновлён: В работе.")
   try:
-    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.message.edit_reply_markup(reply_markup=_staff_order_and_special_keyboard(client_id, ticket_kind="order"))
   except Exception:
     pass
   await callback.message.reply(
       f"⚙️ Статус заказа клиента <code>{client_id}</code> ({services_label}) переведён в <b>В работе</b>.",
+      parse_mode="HTML",
+  )
+
+
+@router.callback_query(F.data.startswith("staff_set_done_"))
+async def cb_staff_set_order_completed(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  await _reset_staff_reply_state_if_needed(callback.bot, callback.from_user.id, state)
+  try:
+    client_id = int(callback.data.split("_")[-1])
+  except ValueError:
+    return
+
+  updated_count, service_names = await set_user_orders_completed_db(client_id)
+  if updated_count <= 0:
+    await callback.answer("Заказы для обновления не найдены.", show_alert=True)
+    return
+
+  services_label = ", ".join(f"<b>{s}</b>" for s in service_names) if service_names else "<b>ваш заказ</b>"
+  if not await is_user_banned(client_id, USER_MAPPING.get(client_id)):
+    try:
+      await callback.bot.send_message(
+          chat_id=client_id,
+          text=f"✅ Ваш заказ {services_label} выполнен! Статус обновлён: <b>Выполнен</b>.",
+          parse_mode="HTML",
+      )
+    except Exception as e:
+      logger.warning(f"Не удалось уведомить клиента {client_id} о статусе 'Выполнен': {e}")
+
+  await callback.answer("Статус обновлён: Выполнен.")
+  try:
+    await callback.message.edit_reply_markup(reply_markup=_staff_order_and_special_keyboard(client_id, ticket_kind="order"))
+  except Exception:
+    pass
+  await callback.message.reply(
+      f"✅ Статус заказа клиента <code>{client_id}</code> ({services_label}) переведён в <b>Выполнен</b>.",
       parse_mode="HTML",
   )
 
@@ -1830,23 +2361,26 @@ async def cb_staff_reply_unpaid(callback: CallbackQuery, state: FSMContext):
     return
   await callback.answer()
   await state.set_state(StaffQuickReplyForm.waiting_reply)
-  await state.update_data(target_client_id=client_id, ticket_kind="unpaid")
+  await state.update_data(target_client_id=client_id, ticket_kind="unpaid", staff_action="reply")
   await callback.message.reply(
-      f"✍️ Введите сообщение для клиента <code>{client_id}</code> по неоплаченному заказу (или /cancel):",
+      _staff_guide_and_cheatsheet(client_id, "Сообщение по неоплаченному заказу"),
+      reply_markup=_staff_cancel_mode_keyboard(),
       parse_mode="HTML",
   )
 
 
 @router.callback_query(F.data.startswith("staff_cancel_unpaid_"))
-async def cb_staff_cancel_unpaid(callback: CallbackQuery):
+async def cb_staff_cancel_unpaid(callback: CallbackQuery, state: FSMContext):
   if not is_manager_authorized(callback.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(callback.bot, callback.from_user.id, state)
   try:
     client_id = int(callback.data.split("_")[-1])
   except ValueError:
     return
   _cancel_unpaid_followup(client_id)
   PENDING_BILLS.pop(client_id, None)
+  CLIENT_JOURNEY.pop(client_id, None)
   await delete_pending_bill_db(client_id)
   await callback.answer("Отменено.")
   try:
@@ -1857,9 +2391,10 @@ async def cb_staff_cancel_unpaid(callback: CallbackQuery):
 
 
 @router.message(Command("work"))
-async def cmd_manager_work(message: Message):
+async def cmd_manager_work(message: Message, state: FSMContext):
   if not is_manager_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply(
@@ -1882,14 +2417,15 @@ async def cmd_manager_work(message: Message):
     return
 
   services_label = ", ".join(f"<b>{s}</b>" for s in service_names) if service_names else "<b>ваш заказ</b>"
-  try:
-    await message.bot.send_message(
-        chat_id=target_user_id,
-        text=f"⚙️ Ваш заказ {services_label} переведён в статус: <b>В работе</b>.",
-        parse_mode="HTML",
-    )
-  except Exception as e:
-    logger.warning(f"Не удалось уведомить пользователя {target_user_id} о статусе заказа: {e}")
+  if not await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+    try:
+      await message.bot.send_message(
+          chat_id=target_user_id,
+          text=f"⚙️ Ваш заказ {services_label} переведён в статус: <b>В работе</b>.",
+          parse_mode="HTML",
+      )
+    except Exception as e:
+      logger.warning(f"Не удалось уведомить пользователя {target_user_id} о статусе заказа: {e}")
 
   await message.reply(
       f"✅ Статус заказа(ов) пользователя <code>{target_user_id}</code> переведен в <b>В работе</b> (обновлено записей: {updated_count}).",
@@ -1898,9 +2434,10 @@ async def cmd_manager_work(message: Message):
 
 
 @router.message(Command("ban"))
-async def cmd_ban_user(message: Message):
+async def cmd_ban_user(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply("❌ Использование: `/ban <user_id или @username>`", parse_mode="Markdown")
@@ -1908,15 +2445,17 @@ async def cmd_ban_user(message: Message):
   target_user_id = _resolve_user_target(args[1])
   if target_user_id:
     await ban_user_in_db(target_user_id)
-    await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> заблокирован.", parse_mode="HTML")
+    await purge_banned_user_activity(target_user_id, USER_MAPPING.get(target_user_id))
+    await message.reply(f"✅ Пользователь с ID <code>{target_user_id}</code> заблокирован, все задачи и диалоги сброшены.", parse_mode="HTML")
   else:
     await message.reply("❌ Пользователь не найден.")
 
 
 @router.message(Command("unban"))
-async def cmd_unban_user(message: Message):
+async def cmd_unban_user(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply("❌ Использование: `/unban <user_id или @username>`", parse_mode="Markdown")
@@ -1930,9 +2469,10 @@ async def cmd_unban_user(message: Message):
 
 
 @router.message(Command("ans"))
-async def cmd_admin_answer(message: Message):
+async def cmd_admin_answer(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=2)
   if len(args) < 3:
     await message.reply("❌ Использование: `/ans <user_id> <текст ответа>`", parse_mode="Markdown")
@@ -1943,8 +2483,11 @@ async def cmd_admin_answer(message: Message):
     await message.reply("❌ Неверный ID пользователя.")
     return
   target_user_id = int(target_user_id_str)
+  if await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+    await message.reply("❌ Пользователь заблокирован.")
+    return
   try:
-    await _activate_send_thread(message.bot, target_user_id)
+    await _activate_send_thread(message.bot, target_user_id, kind="support", context_label="Ответ поддержки")
     await message.bot.send_message(
         chat_id=target_user_id,
         text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{reply_text}",
@@ -1956,10 +2499,13 @@ async def cmd_admin_answer(message: Message):
     await message.reply(f"❌ Ошибка отправки: {e}")
 
 
-@router.message(F.from_user.id == ADMIN_ID, F.reply_to_message)
-async def admin_reply_handler(message: Message):
-  if not is_admin_authorized(message.from_user.id):
+@router.message(F.from_user.id.in_({uid for uid in (ADMIN_ID, MANAGER_ID) if uid}), F.reply_to_message)
+async def staff_reply_handler(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
     return
+  # При ответе реплаем сбрасываем активный режим ручного ответа конкретному клиенту
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
+
   reply_msg = message.reply_to_message
   text_to_parse = (reply_msg.text or "") + (reply_msg.caption or "")
 
@@ -1971,11 +2517,20 @@ async def admin_reply_handler(message: Message):
 
   if match:
     target_user_id = int(match.group(1))
+    if await is_user_banned(target_user_id, USER_MAPPING.get(target_user_id)):
+      await message.reply("❌ Пользователь заблокирован.")
+      return
+    reply_body = (message.text or "").strip()
+    if is_pure_manager(message.from_user.id):
+      forbidden_reason = _check_manager_forbidden_requisites(reply_body)
+      if forbidden_reason:
+        await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
+        return
     try:
-      await _activate_send_thread(message.bot, target_user_id)
+      await _activate_send_thread(message.bot, target_user_id, kind="support", context_label="Ответ реплаем")
       await message.bot.send_message(
           chat_id=target_user_id,
-          text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{message.text}",
+          text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{reply_body}",
           reply_markup=_client_send_thread_keyboard(target_user_id),
           parse_mode="HTML",
       )
@@ -1987,9 +2542,10 @@ async def admin_reply_handler(message: Message):
 
 
 @router.message(Command("clear_cache"))
-async def cmd_clear_cache(message: Message):
+async def cmd_clear_cache(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   BANNER_CACHE.clear()
   await message.reply("✅ Кеш баннеров успешно очищен.")
 
@@ -2012,9 +2568,10 @@ def _is_crypto_asset_and_network(asset: str, network: str) -> bool:
 
 
 @router.message(Command("add"))
-async def cmd_add_requisites(message: Message):
+async def cmd_add_requisites(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply(
@@ -2063,9 +2620,10 @@ async def cmd_add_requisites(message: Message):
 
 
 @router.message(Command("delete"))
-async def cmd_delete_requisites(message: Message):
+async def cmd_delete_requisites(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   global CARD_DETAILS, CRYPTO_WALLETS
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
@@ -2112,9 +2670,10 @@ async def cmd_delete_requisites(message: Message):
 
 
 @router.message(Command("freeze"))
-async def cmd_freeze_requisites(message: Message):
+async def cmd_freeze_requisites(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
   args = message.text.split(maxsplit=1)
   if len(args) < 2:
     await message.reply("❌ Использование: `/freeze <реквизиты/адрес> <валюта/банк> <сеть/страна>`", parse_mode="Markdown")
@@ -2161,9 +2720,10 @@ async def cmd_freeze_requisites(message: Message):
 
 
 @router.message(Command("list"))
-async def cmd_list_requisites(message: Message):
+async def cmd_list_requisites(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
+  await _reset_staff_reply_state_if_needed(message.bot, message.from_user.id, state)
 
   now = datetime.datetime.now()
   cards_changed = False
@@ -2198,45 +2758,50 @@ async def cmd_list_requisites(message: Message):
   if wallets_changed:
     await sync_crypto_wallets_db()
 
-  lines = ["📋 <b>Список актуальных реквизитов:</b>\n"]
+  lines = [
+      "📋 <b>Реестр реквизитов и показателей</b>",
+      f"• Активных карт/СБП: <b>{len(active_cards)}</b> | Зафрижено: <b>{len(frozen_cards)}</b>",
+      f"• Активных криптокошельков: <b>{len(active_wallets)}</b> | Зафрижено: <b>{len(frozen_wallets)}</b>",
+      f"• Пользователей в базе: <b>{len(KNOWN_USERS)}</b> | Ожидают счёт: <b>{len(PENDING_BILLS)}</b>\n",
+  ]
 
   lines.append("💳 <b>Карты / СБП / Номера (актуальные):</b>")
   if active_cards:
     for idx, c in enumerate(active_cards, start=1):
-      lines.append(f"{idx}. 🌍 {c['country']} | 🏦 {c['bank']} — <code>{c['details']}</code>")
+      lines.append(f"  {idx}. 🌍 <b>{c['country']}</b> · 🏦 <b>{c['bank']}</b> — <code>{c['details']}</code>")
   else:
-    lines.append("<i>Нет активных реквизитов.</i>")
+    lines.append("  <i>Нет активных реквизитов.</i>")
 
-  lines.append("\n🪙 <b>Крипта (актуальные):</b>")
+  lines.append("\n🪙 <b>Криптовалютные кошельки (актуальные):</b>")
   if active_wallets:
     for idx, w in enumerate(active_wallets, start=1):
-      lines.append(f"{idx}. 🪙 {w['asset']} | 🌐 {w['network']} — <code>{w['address']}</code>")
+      lines.append(f"  {idx}. 🪙 <b>{w['asset']}</b> · 🌐 <b>{w['network']}</b> — <code>{w['address']}</code>")
   else:
-    lines.append("<i>Нет активных кошельков.</i>")
+    lines.append("  <i>Нет активных кошельков.</i>")
 
   lines.append("\n❄️ <b>Зафриженные на 24 часа (недоступны):</b>")
   has_frozen = bool(frozen_cards or frozen_wallets)
   if not has_frozen:
-    lines.append("<i>Нет зафриженных реквизитов.</i>")
+    lines.append("  <i>Нет зафриженных реквизитов.</i>")
   else:
     if frozen_cards:
-      lines.append("💳 <i>Карты / СБП / Номера:</i>")
+      lines.append("  💳 <i>Карты / СБП / Номера:</i>")
       for idx, (c, until_dt) in enumerate(frozen_cards, start=1):
         rem = until_dt - now
         rem_hours = max(1, int(rem.total_seconds() // 3600))
         rem_mins = int((rem.total_seconds() % 3600) // 60)
         lines.append(
-            f"{idx}. 🌍 {c['country']} | 🏦 {c['bank']} — <code>{c['details']}</code> "
+            f"    {idx}. 🌍 <b>{c['country']}</b> · 🏦 <b>{c['bank']}</b> — <code>{c['details']}</code> "
             f"(до {until_dt.strftime('%d.%m %H:%M')}, ост. {rem_hours}ч {rem_mins}м)"
         )
     if frozen_wallets:
-      lines.append("🪙 <i>Крипта:</i>")
+      lines.append("  🪙 <i>Крипта:</i>")
       for idx, (w, until_dt) in enumerate(frozen_wallets, start=1):
         rem = until_dt - now
         rem_hours = max(1, int(rem.total_seconds() // 3600))
         rem_mins = int((rem.total_seconds() % 3600) // 60)
         lines.append(
-            f"{idx}. 🪙 {w['asset']} | 🌐 {w['network']} — <code>{w['address']}</code> "
+            f"    {idx}. 🪙 <b>{w['asset']}</b> · 🌐 <b>{w['network']}</b> — <code>{w['address']}</code> "
             f"(до {until_dt.strftime('%d.%m %H:%M')}, ост. {rem_hours}ч {rem_mins}м)"
         )
 
@@ -2296,9 +2861,10 @@ async def scheduled_broadcast(bot: Bot):
     banner_path = get_banner_path("special_offer.jpg")
     for user_id, last_time in list(KNOWN_USERS.items()):
       if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+        await purge_banned_user_activity(user_id, USER_MAPPING.get(user_id))
         continue
       ref_time = LAST_BROADCAST.get(user_id) or last_time
-      if ref_time is None or (now - ref_time).total_seconds() >= 24 * 3600:
+      if ref_time is None or (now - ref_time).total_seconds() >= 48 * 3600:
         try:
           today = datetime.date.today()
           target_date = today + datetime.timedelta(days=3)
@@ -2350,6 +2916,9 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int, delay_seconds:
     if delay_seconds > 0:
       await asyncio.sleep(delay_seconds)
     if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+      await purge_banned_user_activity(user_id, USER_MAPPING.get(user_id))
+      return
+    if not await _has_current_unpaid_order(user_id):
       ABANDONED_CHECKOUTS.pop(user_id, None)
       await delete_abandoned_reminder_db(user_id)
       return
@@ -2386,6 +2955,161 @@ async def delayed_abandoned_cart_reminder(bot: Bot, user_id: int, delay_seconds:
 
 def get_order_details_text(data):
   return f"• Цель: <b>{data.get('target_username')}</b>\n"
+
+
+# === ВОЗВРАТ НА ПРЕДЫДУЩИЙ ШАГ ПРИ ОФОРМЛЕНИИ ЗАКАЗА ===
+def _get_target_prompt_for_service(service_name: str) -> str:
+  link_services = ["снос сайта", "снос tg канала или бота", "ddos-атака сайта", "слив базы сайта"]
+  if service_name.lower() in link_services:
+    return "Введите ссылку на ресурс цели следующим сообщением:"
+  return "Введите юзернейм или ссылку на профиль цели следующим сообщением:"
+
+
+async def _render_summary_step(event: CallbackQuery | Message, state: FSMContext):
+  data = await state.get_data()
+  price = data.get("total_price", 0)
+  service_name = data.get("service_name") or "Услуга"
+  target_val = data.get("target_username") or ""
+  await track_client_step(
+      event.bot,
+      event.from_user,
+      "summary",
+      service_name=service_name,
+      price=price,
+      target=target_val,
+      force_current_step=True,
+  )
+  summary_text = (
+      "✨ <b>Сводка заказа:</b>\n\n"
+      f"• Услуга: <b>{service_name}</b>\n"
+      f"{get_order_details_text(data)}"
+      f"💵 <b>К оплате: {_format_price(price)}$</b>"
+  )
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_summary", style="danger")],
+      ]
+  )
+  await render_step(event, state, "summary.jpg", summary_text, keyboard)
+
+
+async def _render_payment_menu_step(event: CallbackQuery | Message, state: FSMContext):
+  user_id = event.from_user.id
+  ctx = await _get_payment_context(user_id, state)
+  total_price = ctx["total_price"]
+  await track_client_step(
+      event.bot,
+      event.from_user,
+      "payment_menu",
+      service_name=ctx["service_name"],
+      price=total_price,
+      target=ctx["target_username"],
+      force_current_step=True,
+  )
+
+  if user_id in ABANDONED_CHECKOUTS:
+    task = ABANDONED_CHECKOUTS.pop(user_id, None)
+    if task:
+      task.cancel()
+  remind_at = datetime.datetime.now() + datetime.timedelta(seconds=1800)
+  await save_abandoned_reminder_db(user_id, remind_at)
+  ABANDONED_CHECKOUTS[user_id] = asyncio.create_task(
+      delayed_abandoned_cart_reminder(event.bot, user_id, delay_seconds=1800.0)
+  )
+
+  payment_text = (
+      "⏳ <b>Оплата заказа</b>\n"
+      "Время на завершение: <b><u>20:00</u></b>\n\n"
+      f"💳 <b>Выберите способ оплаты</b>\n"
+      f"К оплате: <b>{_format_price(total_price)}$</b>"
+  )
+  await render_step(event, state, "payment.jpg", payment_text, _build_payment_keyboard())
+
+
+@router.callback_query(F.data == "back_from_target")
+async def cb_back_from_target(callback: CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  await state.set_state(OrderForm.service)
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "catalog",
+      service_name=data.get("service_name"),
+      price=data.get("total_price"),
+      target=data.get("target_username") or data.get("special_task"),
+      force_current_step=True,
+  )
+  text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
+  await render_step(callback, state, "catalog.jpg", text, _build_catalog_keyboard())
+
+
+@router.callback_query(F.data == "back_from_special_link")
+async def cb_back_from_special_link(callback: CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  service_name = data.get("service_name") or "Особый заказ — Рассчитать стоимость"
+  prev_task = data.get("special_task") or ""
+  await state.set_state(OrderForm.target_username)
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "service_selected",
+      service_name=service_name,
+      price=0,
+      target=prev_task or "—",
+      force_current_step=True,
+  )
+  hint = f"\n<i>Ранее введено: {prev_task}</i>" if prev_task else ""
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_target", style="danger")]]
+  )
+  text = (
+      f"🛠 Услуга: <b>{service_name}</b>\n\n"
+      f"📝 <b>Описание задачи</b>\n\n"
+      f"Опишите задачу следующим сообщением:{hint}"
+  )
+  await render_step(callback, state, "target_data.jpg", text, keyboard)
+
+
+@router.callback_query(F.data == "back_from_summary")
+async def cb_back_from_summary(callback: CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  price = data.get("total_price", 0)
+  service_name = data.get("service_name") or "Услуга"
+  prev_target = data.get("target_username") or ""
+  await state.set_state(OrderForm.target_username)
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "service_selected",
+      service_name=service_name,
+      price=price,
+      target=prev_target or "—",
+      force_current_step=True,
+  )
+  target_prompt = _get_target_prompt_for_service(service_name)
+  hint = f"\n<i>Ранее введено: {prev_target}</i>" if prev_target else ""
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_target", style="danger")]]
+  )
+  text = (
+      f"⚡️ Услуга: <b>{service_name} ({_format_price(price)}$)</b>\n\n"
+      f"🎯 <b>Данные цели</b>\n\n"
+      f"{target_prompt}{hint}"
+  )
+  await render_step(callback, state, "target_data.jpg", text, keyboard)
+
+
+@router.callback_query(F.data == "back_from_payment")
+async def cb_back_from_payment(callback: CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  if data.get("target_username") and data.get("service_name"):
+    await _render_summary_step(callback, state)
+  else:
+    await state.set_state(OrderForm.service)
+    await track_client_step(callback.bot, callback.from_user, "catalog", force_current_step=True)
+    text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
+    await render_step(callback, state, "catalog.jpg", text, _build_catalog_keyboard())
 
 
 # === ОБРАБОТЧИКИ КОМАНД ===
@@ -2528,7 +3252,10 @@ async def process_support_reason(message: Message, state: FSMContext):
 
 
 async def _send_support_ticket_to_staff(bot: Bot, user, reason_text: str, photo_id: str | None = None):
-  await _activate_send_thread(bot, user.id)
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+  await _activate_send_thread(bot, user.id, kind="support", context_label=f"Поддержка: {reason_text[:60]}")
   user_badge = _format_user_badge(user.id, user.username)
   journey_summary = _build_client_journey_summary(user.id)
   ticket_text = (
@@ -2615,17 +3342,20 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(OrderForm.service, F.data == "srv_special_order")
 async def process_special_order_service(callback: CallbackQuery, state: FSMContext):
   service_name = "Особый заказ — Рассчитать стоимость"
+  data = await state.get_data()
+  prev_task = data.get("special_task") or ""
   await state.update_data(service_name=service_name, total_price=0)
   await state.set_state(OrderForm.target_username)
   await track_client_step(callback.bot, callback.from_user, "service_selected", service_name=service_name, price=0)
 
+  hint = f"\n<i>Ранее введено: {prev_task}</i>" if prev_task else ""
   keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_target", style="danger")]]
   )
   text = (
       f"🛠 Услуга: <b>{service_name}</b>\n\n"
       f"📝 <b>Описание задачи</b>\n\n"
-      f"Опишите задачу следующим сообщением:"
+      f"Опишите задачу следующим сообщением:{hint}"
   )
   await render_step(callback, state, "target_data.jpg", text, keyboard)
 
@@ -2636,23 +3366,21 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
   price = int(parts[-1])
   service_name = " ".join(parts[1:-1]).replace("_", " ")
 
+  data = await state.get_data()
+  prev_target = data.get("target_username") or ""
   await state.update_data(service_name=service_name, total_price=price)
   await state.set_state(OrderForm.target_username)
   await track_client_step(callback.bot, callback.from_user, "service_selected", service_name=service_name, price=price)
 
-  link_services = ["снос сайта", "снос tg канала или бота", "ddos-атака сайта", "слив базы сайта"]
-  if service_name.lower() in link_services:
-    target_prompt = "Введите ссылку на ресурс цели следующим сообщением:"
-  else:
-    target_prompt = "Введите юзернейм или ссылку на профиль цели следующим сообщением:"
-
+  target_prompt = _get_target_prompt_for_service(service_name)
+  hint = f"\n<i>Ранее введено: {prev_target}</i>" if prev_target else ""
   keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_target", style="danger")]]
   )
   text = (
       f"⚡️ Услуга: <b>{service_name} ({price}$)</b>\n\n"
       f"🎯 <b>Данные цели</b>\n\n"
-      f"{target_prompt}"
+      f"{target_prompt}{hint}"
   )
   await render_step(callback, state, "target_data.jpg", text, keyboard)
 
@@ -2665,6 +3393,7 @@ async def process_target_username(message: Message, state: FSMContext):
 
   if not price:
     special_task_text = message.text.strip()
+    prev_link = data.get("special_link") or ""
     await state.update_data(special_task=special_task_text)
     await state.set_state(OrderForm.special_link)
     await track_client_step(
@@ -2675,13 +3404,14 @@ async def process_target_username(message: Message, state: FSMContext):
         price=0,
         target=special_task_text,
     )
+    hint = f"\n<i>Ранее введено: {prev_link}</i>" if prev_link else ""
     keyboard = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_special_link", style="danger")]]
     )
     text = (
         f"🛠 Услуга: <b>{data.get('service_name')}</b>\n\n"
         f"🔗 <b>Ссылка на цель</b>\n\n"
-        f"Отправьте ссылку на цель следующим сообщением:"
+        f"Отправьте ссылку на цель следующим сообщением:{hint}"
     )
     await render_step(message, state, "target_data.jpg", text, keyboard)
     return
@@ -2706,7 +3436,7 @@ async def process_target_username(message: Message, state: FSMContext):
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text="💳 Перейти к оплате", callback_data="go_to_payment", style="primary")],
-          [InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_from_summary", style="danger")],
       ]
   )
   await render_step(message, state, "summary.jpg", summary_text, keyboard)
@@ -2716,10 +3446,16 @@ async def process_target_username(message: Message, state: FSMContext):
 async def process_special_order_link(message: Message, state: FSMContext):
   await track_user(message.from_user)
   link = message.text.strip()
+  await state.update_data(special_link=link)
   data = await state.get_data()
   task_desc = data.get("special_task", "")
   user = message.from_user
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+
   user_badge = _format_user_badge(user.id, user.username)
+  await _activate_send_thread(message.bot, user.id, kind="special", context_label=f"Особый заказ: {task_desc[:50]}")
   await track_client_step(
       message.bot,
       user,
@@ -2755,35 +3491,7 @@ async def process_special_order_link(message: Message, state: FSMContext):
 
 @router.callback_query(F.data == "go_to_payment")
 async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
-  user_id = callback.from_user.id
-  ctx = await _get_payment_context(user_id, state)
-  total_price = ctx["total_price"]
-  await track_client_step(
-      callback.bot,
-      callback.from_user,
-      "payment_menu",
-      service_name=ctx["service_name"],
-      price=total_price,
-      target=ctx["target_username"],
-  )
-
-  if user_id in ABANDONED_CHECKOUTS:
-    task = ABANDONED_CHECKOUTS.pop(user_id, None)
-    if task:
-      task.cancel()
-  remind_at = datetime.datetime.now() + datetime.timedelta(seconds=1800)
-  await save_abandoned_reminder_db(user_id, remind_at)
-  ABANDONED_CHECKOUTS[user_id] = asyncio.create_task(
-      delayed_abandoned_cart_reminder(callback.bot, user_id, delay_seconds=1800.0)
-  )
-
-  payment_text = (
-      "⏳ <b>Оплата заказа</b>\n"
-      "Время на завершение: <b><u>20:00</u></b>\n\n"
-      f"💳 <b>Выберите способ оплаты</b>\n"
-      f"К оплате: <b>{_format_price(total_price)}$</b>"
-  )
-  await render_step(callback, state, "payment.jpg", payment_text, _build_payment_keyboard())
+  await _render_payment_menu_step(callback, state)
 
 
 @router.callback_query(F.data.startswith("pay_currency_"))
@@ -2845,7 +3553,10 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "payment_help_manager")
 async def process_payment_help_manager(callback: CallbackQuery):
   user = callback.from_user
-  await _activate_send_thread(callback.bot, user.id)
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+  await _activate_send_thread(callback.bot, user.id, kind="payment", context_label="Проблема с оплатой")
   user_badge = _format_user_badge(user.id, user.username)
   journey_summary = _build_client_journey_summary(user.id)
   help_text = (
@@ -2907,11 +3618,16 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
     return
 
   user = callback.from_user
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+
   _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user.id)
+  CLIENT_JOURNEY.pop(user.id, None)
 
   ctx = await _get_payment_context(user.id, state)
   service_name = ctx["service_name"]
@@ -2922,9 +3638,10 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   await add_order_to_db(user.id, service_name, total_price, "✅ Оплачено через CryptoBot", target_info)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
+  await _activate_send_thread(callback.bot, user.id, kind="order", context_label=f"Заказ: {service_name}")
 
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  order_kb = _staff_paid_order_keyboard(user.id)
+  order_kb = _staff_order_and_special_keyboard(user.id, ticket_kind="order")
   for uid in notify_ids:
     try:
       await callback.bot.send_message(
@@ -2932,7 +3649,9 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
           text=(
               f"🤖 Успешная оплата CryptoBot от {_format_user_badge(user.id, user.username)}\n"
               f"• Услуга: <b>{service_name}</b>\n"
-              f"• Цель: {target_username}"
+              f"• Сумма: <b>{_format_price(total_price)}$</b>\n"
+              f"• Цель: {target_username}\n"
+              f"• Статус заказа: <b>✅ Оплачено через CryptoBot</b>"
           ),
           reply_markup=order_kb,
           parse_mode="HTML",
@@ -3047,11 +3766,16 @@ async def ask_for_receipt(callback: CallbackQuery, state: FSMContext):
 @router.message(OrderForm.receipt, F.photo)
 async def process_receipt_photo(message: Message, state: FSMContext):
   user = message.from_user
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+
   _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user.id)
+  CLIENT_JOURNEY.pop(user.id, None)
 
   ctx = await _get_payment_context(user.id, state)
   service_name = ctx["service_name"]
@@ -3062,9 +3786,10 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
+  await _activate_send_thread(message.bot, user.id, kind="order", context_label=f"Заказ: {service_name}")
 
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  order_kb = _staff_paid_order_keyboard(user.id)
+  order_kb = _staff_order_and_special_keyboard(user.id, ticket_kind="order")
   for uid in notify_ids:
     try:
       await message.bot.send_photo(
@@ -3074,7 +3799,8 @@ async def process_receipt_photo(message: Message, state: FSMContext):
               f"🛒 Новый чек от {_format_user_badge(user.id, user.username)}\n"
               f"• Услуга: <b>{service_name}</b>\n"
               f"• Цель: {target_username}\n"
-              f"• К оплате: {_format_price(total_price)} USDT"
+              f"• Сумма: <b>{_format_price(total_price)}$</b> ({_format_price(total_price)} USDT)\n"
+              f"• Статус заказа: <b>⏳ Ожидает проверки чека</b>"
           ),
           reply_markup=order_kb,
           parse_mode="HTML",
@@ -3098,11 +3824,16 @@ async def process_receipt_document(message: Message, state: FSMContext):
     return
 
   user = message.from_user
+  if await is_user_banned(user.id, user.username):
+    await purge_banned_user_activity(user.id, user.username)
+    return
+
   _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user.id)
+  CLIENT_JOURNEY.pop(user.id, None)
 
   service_name = ctx["service_name"]
   total_price = ctx["total_price"]
@@ -3112,9 +3843,10 @@ async def process_receipt_document(message: Message, state: FSMContext):
   await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
+  await _activate_send_thread(message.bot, user.id, kind="order", context_label=f"Заказ: {service_name}")
 
   notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  order_kb = _staff_paid_order_keyboard(user.id)
+  order_kb = _staff_order_and_special_keyboard(user.id, ticket_kind="order")
   for uid in notify_ids:
     try:
       await message.bot.send_document(
@@ -3124,7 +3856,8 @@ async def process_receipt_document(message: Message, state: FSMContext):
               f"🛒 Новая квитанция (документ) от {_format_user_badge(user.id, user.username)}\n"
               f"• Услуга: <b>{service_name}</b>\n"
               f"• Цель: {target_username}\n"
-              f"• К оплате: {_format_price(total_price)} USDT"
+              f"• Сумма: <b>{_format_price(total_price)}$</b> ({_format_price(total_price)} USDT)\n"
+              f"• Статус заказа: <b>⏳ Ожидает проверки чека</b>"
           ),
           reply_markup=order_kb,
           parse_mode="HTML",
