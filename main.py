@@ -1112,11 +1112,12 @@ async def _send_unpaid_order_manager_alert(
     user_id: int,
     trigger_key: str,
     reason_note: str | None = None,
+    allow_repeat_back: bool = False,
 ):
   """Отправляет уведомление о неоплаченном заказе менеджеру и админу по формату со скриншота."""
   if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
     return
-  if (user_id, "unpaid") in CLOSED_TICKETS:
+  if not allow_repeat_back and (user_id, "unpaid") in CLOSED_TICKETS:
     return
   dedup_key = (user_id, trigger_key)
   if dedup_key in UNPAID_ALERT_SENT_KEYS:
@@ -1195,11 +1196,14 @@ async def _handle_back_navigation_unpaid_alert(bot: Bot, user, from_stage_label:
     return
   j["has_unpaid_active"] = True
   j["step_label"] = from_stage_label
+  back_seq = int(j.get("back_alert_seq", 0)) + 1
+  j["back_alert_seq"] = back_seq
   await _send_unpaid_order_manager_alert(
       bot=bot,
       user_id=uid,
-      trigger_key=f"back_from_{from_stage_label}_{j.get('service_name') or ''}",
+      trigger_key=f"back_{back_seq}_from_{from_stage_label}_{j.get('service_name') or ''}",
       reason_note=f"клиент нажал «Назад» на этапе «{from_stage_label}» без оплаты.",
+      allow_repeat_back=True,
   )
 
 
@@ -1256,6 +1260,7 @@ async def track_client_step(
       "problem_kind": problem_kind if problem_kind is not None else prev.get("problem_kind"),
       "problem_query": problem_query if problem_query is not None else prev.get("problem_query"),
       "has_unpaid_active": unpaid_flag,
+      "back_alert_seq": prev.get("back_alert_seq", 0),
       "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
   }
 
@@ -2577,7 +2582,8 @@ async def cb_staff_close_ticket(callback: CallbackQuery, state: FSMContext):
     return
 
   await state.clear()
-  CLOSED_TICKETS.add((client_id, kind))
+  if kind != "unpaid":
+    CLOSED_TICKETS.add((client_id, kind))
   _cancel_unpaid_followup(client_id)
   PENDING_BILLS.pop(client_id, None)
   await delete_pending_bill_db(client_id)
@@ -2585,7 +2591,7 @@ async def cb_staff_close_ticket(callback: CallbackQuery, state: FSMContext):
   if journey is not None:
     journey["has_unpaid_active"] = False
     journey["problem_kind"] = None
-  await _close_send_thread(callback.bot, client_id, notify_client=True)
+  await _close_send_thread(callback.bot, client_id, notify_client=(kind != "unpaid"))
 
   await callback.answer("Обращение закрыто.")
   try:
