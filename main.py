@@ -1114,7 +1114,7 @@ async def _send_unpaid_order_manager_alert(
     reason_note: str | None = None,
     allow_repeat_back: bool = False,
 ):
-  """Отправляет уведомление о неоплаченном заказе менеджеру и админу по формату со скриншота."""
+  """Отправляет уведомление о неоплаченном заказе менеджеру и админу строго один раз за заход на выбор способа оплаты."""
   if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
     return
   if not allow_repeat_back and (user_id, "unpaid") in CLOSED_TICKETS:
@@ -1127,7 +1127,14 @@ async def _send_unpaid_order_manager_alert(
   if not (j.get("service_selected") or j.get("has_unpaid_active") or user_id in PENDING_BILLS):
     return
 
+  # Фиксируем факт отправки на текущий заход на выбор способа оплаты, чтобы не было дублей
+  cycle_seq = int(j.get("payment_cycle_seq", 0))
+  cycle_sent_key = (user_id, f"payment_method_alert_cycle_{cycle_seq}")
+  if cycle_sent_key in UNPAID_ALERT_SENT_KEYS:
+    return
+
   UNPAID_ALERT_SENT_KEYS.add(dedup_key)
+  UNPAID_ALERT_SENT_KEYS.add(cycle_sent_key)
   j["problem_kind"] = "unpaid"
   j["has_unpaid_active"] = True
   await _activate_send_thread(bot, user_id, kind="unpaid")
@@ -1145,11 +1152,12 @@ async def _send_unpaid_order_manager_alert(
       logger.warning(f"Не удалось отправить уведомление о неоплаченном заказе ({uid}): {e}")
 
 
-async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 600.0):
+async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 900.0, cycle_seq: int = 0):
   try:
     if delay_seconds > 0:
       await asyncio.sleep(delay_seconds)
-    UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
+    if UNPAID_FOLLOWUP_TASKS.get(user_id) is asyncio.current_task():
+      UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
 
     if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
       return
@@ -1158,12 +1166,18 @@ async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 60
       return
 
     journey = CLIENT_JOURNEY.get(user_id) or {}
-    stage_label = journey.get("step_label") or "Этап оплаты"
+    if journey.get("step") != "payment_menu":
+      return
+    if int(journey.get("payment_cycle_seq", 0)) != cycle_seq:
+      return
+
+    stage_label = journey.get("step_label") or STEP_LABELS["payment_menu"]
     await _send_unpaid_order_manager_alert(
         bot=bot,
         user_id=user_id,
-        trigger_key=f"timeout_10m_{journey.get('step') or 'payment'}",
-        reason_note=f"прошло 10 минут на этапе «{stage_label}», оплата не поступила.",
+        trigger_key=f"payment_method_timeout_15m_cycle_{cycle_seq}",
+        reason_note=f"прошло 15 минут бездействия на этапе выбора способа оплаты («{stage_label}»), оплата не поступила.",
+        allow_repeat_back=True,
     )
   except asyncio.CancelledError:
     pass
@@ -1175,35 +1189,35 @@ def _cancel_unpaid_followup(user_id: int):
     task.cancel()
 
 
-def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 600.0):
+def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 900.0, cycle_seq: int = 0):
   _cancel_unpaid_followup(user_id)
   UNPAID_FOLLOWUP_TASKS[user_id] = asyncio.create_task(
-      _unpaid_followup_job(bot, user_id, delay_seconds=delay_seconds)
+      _unpaid_followup_job(bot, user_id, delay_seconds=delay_seconds, cycle_seq=cycle_seq)
   )
 
 
-async def _handle_back_navigation_unpaid_alert(bot: Bot, user, from_stage_label: str):
-  """Вызывается при нажатии 'Назад' после выбора услуги в каталоге без оплаты — ровно один раз за это нажатие."""
+async def _handle_payment_method_back_unpaid_alert(bot: Bot, user):
+  """Вызывается при нажатии 'Назад' на этапе выбора способа оплаты — ровно один раз за этот заход."""
   if not user:
     return
   uid = user.id
   if await is_user_banned(uid, user.username):
     return
   j = CLIENT_JOURNEY.get(uid) or {}
+  if j.get("step") != "payment_menu":
+    return
   if not (j.get("service_selected") or j.get("has_unpaid_active") or uid in PENDING_BILLS):
     return
   if j.get("order_status") in {"✅ Оплачено через CryptoBot", "⏳ Ожидает проверки чека", "⚙️ В работе", "✅ Выполнен"}:
     return
+  _cancel_unpaid_followup(uid)
   j["has_unpaid_active"] = True
-  j["step_label"] = from_stage_label
-  back_seq = int(j.get("back_alert_seq", 0)) + 1
-  j["back_alert_seq"] = back_seq
-  service_tag = j.get("service_name") or ""
+  cycle_seq = int(j.get("payment_cycle_seq", 0))
   await _send_unpaid_order_manager_alert(
       bot=bot,
       user_id=uid,
-      trigger_key=f"back_{back_seq}_from_{from_stage_label}_{service_tag}",
-      reason_note=f"клиент нажал «Назад» на этапе «{from_stage_label}» без оплаты.",
+      trigger_key=f"payment_method_back_cycle_{cycle_seq}",
+      reason_note="клиент нажал «Назад» на этапе выбора способа оплаты без оплаты.",
       allow_repeat_back=True,
   )
 
@@ -1241,6 +1255,10 @@ async def track_client_step(
   if rank >= STEP_RANK["summary"]:
     unpaid_flag = True
 
+  payment_cycle_seq = int(prev.get("payment_cycle_seq", 0))
+  if step_key == "payment_menu" and prev.get("step") != "payment_menu":
+    payment_cycle_seq += 1
+
   CLIENT_JOURNEY[uid] = {
       "user_id": uid,
       "username": user.username or prev.get("username") or USER_MAPPING.get(uid),
@@ -1261,12 +1279,14 @@ async def track_client_step(
       "problem_kind": problem_kind if problem_kind is not None else prev.get("problem_kind"),
       "problem_query": problem_query if problem_query is not None else prev.get("problem_query"),
       "has_unpaid_active": unpaid_flag,
-      "back_alert_seq": prev.get("back_alert_seq", 0),
+      "payment_cycle_seq": payment_cycle_seq,
       "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
   }
 
-  if rank >= STEP_RANK["payment_menu"] and unpaid_flag:
-    _schedule_unpaid_followup(bot, uid, delay_seconds=600.0)
+  if step_key == "payment_menu" and unpaid_flag:
+    _schedule_unpaid_followup(bot, uid, delay_seconds=900.0, cycle_seq=payment_cycle_seq)
+  elif step_key != "payment_menu":
+    _cancel_unpaid_followup(uid)
 
 
 def _build_client_journey_summary(user_id: int, order_status_override: str | None = None) -> str:
@@ -1542,13 +1562,19 @@ async def _issue_bill_to_client(
 
   journey = CLIENT_JOURNEY.get(target_user_id)
   if journey is not None:
+    cycle_seq = int(journey.get("payment_cycle_seq", 0)) + 1
+    journey["payment_cycle_seq"] = cycle_seq
+    journey["step"] = "payment_menu"
+    journey["step_label"] = STEP_LABELS["payment_menu"]
     journey["service_name"] = service_name
     journey["price"] = amount
     journey["has_unpaid_active"] = True
     journey["service_selected"] = True
     journey["order_status"] = "⏳ Ожидает оплаты счёта"
+  else:
+    cycle_seq = 1
 
-  _schedule_unpaid_followup(bot, target_user_id, delay_seconds=600.0)
+  _schedule_unpaid_followup(bot, target_user_id, delay_seconds=900.0, cycle_seq=cycle_seq)
 
   price_str = _format_price(amount)
   parts_text = []
@@ -3362,9 +3388,7 @@ async def back_home(callback: CallbackQuery, state: FSMContext):
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user_id)
-  cur_step = (CLIENT_JOURNEY.get(user_id) or {}).get("step")
-  if cur_step == "service_selected":
-    await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["service_selected"])
+  _cancel_unpaid_followup(user_id)
   await show_main_menu(callback, state)
 
 
@@ -3546,7 +3570,6 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_to_catalog_keep_data")
 async def back_to_catalog_keep_data(callback: CallbackQuery, state: FSMContext):
   """Возврат в каталог из шага ввода цели/описания с сохранением уже введённых данных в FSM."""
-  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["service_selected"])
   await state.set_state(OrderForm.service)
   await track_client_step(callback.bot, callback.from_user, "catalog")
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
@@ -3556,14 +3579,12 @@ async def back_to_catalog_keep_data(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_to_special_desc")
 async def back_to_special_desc(callback: CallbackQuery, state: FSMContext):
   """Возврат с шага ссылки особого заказа на шаг описания задачи с сохранением данных."""
-  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["target_entered"])
   await _render_target_step(callback, state)
 
 
 @router.callback_query(F.data == "back_to_target_step")
 async def back_to_target_step(callback: CallbackQuery, state: FSMContext):
   """Возврат со сводки заказа на шаг ввода данных цели с сохранением данных."""
-  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["summary"])
   data = await state.get_data()
   if not data.get("total_price") and data.get("special_task"):
     await _render_special_link_step(callback, state)
@@ -3574,7 +3595,7 @@ async def back_to_target_step(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_from_payment")
 async def back_from_payment(callback: CallbackQuery, state: FSMContext):
   """Последовательный возврат с экрана оплаты на предыдущий шаг (сводку заказа или каталог)."""
-  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["payment_menu"])
+  await _handle_payment_method_back_unpaid_alert(callback.bot, callback.from_user)
   data = await state.get_data()
   if data.get("service_name") and data.get("target_username"):
     await _render_summary_step(callback, state)
