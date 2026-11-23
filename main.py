@@ -1124,7 +1124,7 @@ async def _send_unpaid_order_manager_alert(
     return
 
   j = CLIENT_JOURNEY.get(user_id) or {}
-  if not (j.get("catalog_reached") or j.get("service_selected") or j.get("has_unpaid_active") or user_id in PENDING_BILLS):
+  if not (j.get("service_selected") or j.get("has_unpaid_active") or user_id in PENDING_BILLS):
     return
 
   UNPAID_ALERT_SENT_KEYS.add(dedup_key)
@@ -1183,7 +1183,7 @@ def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 600
 
 
 async def _handle_back_navigation_unpaid_alert(bot: Bot, user, from_stage_label: str):
-  """Вызывается при нажатии 'Назад', если клиент уже дошёл до каталога/выбора услуги и не оплатил."""
+  """Вызывается при нажатии 'Назад' после выбора услуги в каталоге без оплаты — ровно один раз за это нажатие."""
   if not user:
     return
   uid = user.id
@@ -1198,10 +1198,11 @@ async def _handle_back_navigation_unpaid_alert(bot: Bot, user, from_stage_label:
   j["step_label"] = from_stage_label
   back_seq = int(j.get("back_alert_seq", 0)) + 1
   j["back_alert_seq"] = back_seq
+  service_tag = j.get("service_name") or ""
   await _send_unpaid_order_manager_alert(
       bot=bot,
       user_id=uid,
-      trigger_key=f"back_{back_seq}_from_{from_stage_label}_{j.get('service_name') or ''}",
+      trigger_key=f"back_{back_seq}_from_{from_stage_label}_{service_tag}",
       reason_note=f"клиент нажал «Назад» на этапе «{from_stage_label}» без оплаты.",
       allow_repeat_back=True,
   )
