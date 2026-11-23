@@ -56,6 +56,14 @@ class SupportForm(StatesGroup):
   photo = State()
 
 
+class ClientThreadReplyForm(StatesGroup):
+  waiting_reply = State()
+
+
+class StaffQuickReplyForm(StatesGroup):
+  waiting_reply = State()
+
+
 # Словари и кэши в памяти (синхронизируются с БД)
 KNOWN_USERS = {}
 LAST_BROADCAST = {}
@@ -67,6 +75,32 @@ CRYPTO_WALLETS = []
 CRYPTO_POINTERS = {}
 BANNER_CACHE = {}
 PENDING_BILLS = {}
+
+# Активные треды / обращения и отслеживание шагов клиентов
+ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task, "expires_at": datetime.datetime, "closed": bool}
+CLIENT_JOURNEY = {}  # user_id -> {"max_step": str, "step_rank": int, "service_name": str, "price": float|int, "target": str, "updated_at": str}
+UNPAID_FOLLOWUP_TASKS = {}  # user_id -> asyncio.Task
+CLOSED_TICKETS = set()  # (client_id, ticket_kind)
+
+STEP_RANK = {
+    "catalog": 1,
+    "service_selected": 2,
+    "target_entered": 3,
+    "summary": 4,
+    "payment_menu": 5,
+    "payment_method_selected": 6,
+    "receipt_requested": 7,
+}
+
+STEP_LABELS = {
+    "catalog": "Каталог услуг",
+    "service_selected": "Выбор услуги / описание задачи",
+    "target_entered": "Ввод данных цели / ссылки",
+    "summary": "Сводка заказа",
+    "payment_menu": "Переход к оплате",
+    "payment_method_selected": "Выбор способа / валюты / сети оплаты",
+    "receipt_requested": "Ожидание отправки чека",
+}
 
 router = Router()
 
@@ -758,6 +792,25 @@ def is_manager_authorized(user_id: int) -> bool:
   return user_id in allowed_ids
 
 
+def is_pure_manager(user_id: int) -> bool:
+  return bool(MANAGER_ID) and user_id == MANAGER_ID and user_id != ADMIN_ID
+
+
+def _get_staff_notify_ids() -> list[int]:
+  ids = []
+  for uid in (ADMIN_ID, MANAGER_ID):
+    if uid and uid not in ids:
+      ids.append(uid)
+  return ids
+
+
+def _format_user_badge(user_id: int, username: str | None = None) -> str:
+  uname = username or USER_MAPPING.get(user_id)
+  if uname:
+    return f"@{uname.lstrip('@')} (<code>{user_id}</code>)"
+  return f"ID: <code>{user_id}</code>"
+
+
 def _resolve_user_target(raw: str) -> int | None:
   cleaned = raw.strip()
   if not cleaned:
@@ -773,6 +826,263 @@ def _format_price(amount: float | int) -> str:
   if isinstance(amount, float) and amount.is_integer():
     return str(int(amount))
   return str(amount)
+
+
+# === ПРОВЕРКА ЗАПРЕЩЁННЫХ РЕКВИЗИТОВ ДЛЯ МЕНЕДЖЕРА (/send и /bill) ===
+_WALLET_PATTERNS = [
+    r"\bT[1-9A-HJ-NP-Za-km-z]{33}\b",  # TRON / TRC-20
+    r"\b0x[a-fA-F0-9]{40}\b",  # EVM (BEP-20 / ERC-20)
+    r"\b(?:UQ|EQ|kQ|0Q)[A-Za-z0-9_-]{46}\b",  # TON base64url
+    r"\b(?:bc1|[13])[a-zA-HJ-NP-Z0-9]{25,62}\b",  # Bitcoin
+    r"\b[LM3][a-km-zA-HJ-NP-Z1-9]{26,33}\b",  # Litecoin
+    r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b",  # Solana / Base58 адреса
+]
+_CARD_PATTERN = re.compile(r"(?<!\d)(?:\d[ -]?){13,19}(?!\d)")
+_PHONE_PATTERN = re.compile(r"(?<!\w)(?:\+?\d[\d\s().-]{7,16}\d)(?!\w)")
+
+
+def _check_manager_forbidden_requisites(text: str) -> str | None:
+  """Проверяет текст на номера карт, номера телефонов и адреса криптокошельков.
+  Названия банков и обычный текст разрешены."""
+  if not text:
+    return None
+
+  for pattern in _WALLET_PATTERNS:
+    if re.search(pattern, text):
+      return "обнаружен адрес криптокошелька"
+
+  for m in _CARD_PATTERN.finditer(text):
+    digits = re.sub(r"\D", "", m.group(0))
+    if 13 <= len(digits) <= 19:
+      return "обнаружен номер карты"
+
+  for m in _PHONE_PATTERN.finditer(text):
+    start, end = m.span()
+    prefix = text[max(0, start - 3) : start].lower()
+    if any(tag in prefix for tag in ("id:", "id ", "код ", "#")):
+      continue
+    digits = re.sub(r"\D", "", m.group(0))
+    if 10 <= len(digits) <= 15:
+      return "обнаружен номер телефона"
+
+  return None
+
+
+# === ОТСЛЕЖИВАНИЕ ШАГОВ КЛИЕНТА И НЕОПЛАЧЕННЫХ ЗАКАЗОВ ===
+async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 900.0):
+  try:
+    if delay_seconds > 0:
+      await asyncio.sleep(delay_seconds)
+    UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
+
+    # Проверяем, не оплатил ли уже клиент
+    orders = await get_user_orders_from_db(user_id)
+    if orders:
+      return
+
+    journey = CLIENT_JOURNEY.get(user_id)
+    if not journey or journey.get("step_rank", 0) < STEP_RANK["summary"]:
+      return
+
+    summary_card = _build_client_journey_summary(user_id)
+    msg_text = (
+        f"⚠️ <b>Неоплаченный заказ (клиент остановился на этапе: {journey.get('step_label')})</b>\n\n"
+        f"{summary_card}\n\n"
+        f"💡 Проведите клиента дальше: напишите ему или отмените/закройте лид."
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="✍️ Написать", callback_data=f"staff_reply_unpaid_{user_id}", style="primary"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data=f"staff_cancel_unpaid_{user_id}", style="danger"),
+            ]
+        ]
+    )
+    for uid in _get_staff_notify_ids():
+      try:
+        await bot.send_message(chat_id=uid, text=msg_text, reply_markup=kb, parse_mode="HTML")
+      except Exception as e:
+        logger.warning(f"Не удалось отправить уведомление о неоплаченном заказе ({uid}): {e}")
+  except asyncio.CancelledError:
+    pass
+
+
+def _cancel_unpaid_followup(user_id: int):
+  task = UNPAID_FOLLOWUP_TASKS.pop(user_id, None)
+  if task:
+    task.cancel()
+
+
+def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 900.0):
+  _cancel_unpaid_followup(user_id)
+  UNPAID_FOLLOWUP_TASKS[user_id] = asyncio.create_task(
+      _unpaid_followup_job(bot, user_id, delay_seconds=delay_seconds)
+  )
+
+
+async def track_client_step(
+    bot: Bot,
+    user,
+    step_key: str,
+    service_name: str | None = None,
+    price: float | int | None = None,
+    target: str | None = None,
+):
+  if not user:
+    return
+  uid = user.id
+  rank = STEP_RANK.get(step_key, 0)
+  prev = CLIENT_JOURNEY.get(uid) or {}
+  max_rank = max(prev.get("step_rank", 0), rank)
+  max_step_key = step_key if rank >= prev.get("step_rank", 0) else prev.get("max_step", step_key)
+
+  CLIENT_JOURNEY[uid] = {
+      "user_id": uid,
+      "username": user.username or prev.get("username"),
+      "step": step_key,
+      "step_label": STEP_LABELS.get(step_key, step_key),
+      "max_step": max_step_key,
+      "max_step_label": STEP_LABELS.get(max_step_key, max_step_key),
+      "step_rank": max_rank,
+      "service_name": service_name if service_name is not None else prev.get("service_name", "—"),
+      "price": price if price is not None else prev.get("price", 0),
+      "target": target if target is not None else prev.get("target", "—"),
+      "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
+  }
+
+  if rank >= STEP_RANK["summary"]:
+    _schedule_unpaid_followup(bot, uid, delay_seconds=900.0)
+
+
+def _build_client_journey_summary(user_id: int) -> str:
+  j = CLIENT_JOURNEY.get(user_id) or {}
+  orders_count = 0
+  try:
+    with sqlite3.connect("bot_database.db") as conn:
+      row = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (user_id,)).fetchone()
+      if row:
+        orders_count = int(row[0])
+  except Exception:
+    pass
+
+  badge = _format_user_badge(user_id, j.get("username"))
+  price_val = j.get("price", 0)
+  price_str = f"{_format_price(price_val)}$" if price_val else "По расчёту"
+  max_label = j.get("max_step_label") or "Вход в бота"
+  cur_label = j.get("step_label") or max_label
+  srv = j.get("service_name") or "—"
+  tgt = j.get("target") or "—"
+  upd = j.get("updated_at") or datetime.datetime.now().strftime("%d.%m %H:%M")
+
+  return (
+      f"📊 <b>Сводка по клиенту:</b>\n"
+      f"• Клиент: {badge}\n"
+      f"• ID: <code>{user_id}</code>\n"
+      f"• Выбранная услуга: <b>{srv}</b> ({price_str})\n"
+      f"• Цель / детали: <b>{tgt}</b>\n"
+      f"• Текущий этап: <b>{cur_label}</b>\n"
+      f"• Максимум дошёл до: <b>{max_label}</b>\n"
+      f"• Заказов в истории: <b>{orders_count}</b>\n"
+      f"• Обновлено: <i>{upd}</i>"
+  )
+
+
+# === ТРЕДЫ /send С КНОПКАМИ И АВТОЗАКРЫТИЕМ ЧЕРЕЗ 1 ЧАС ===
+def _client_send_thread_keyboard(client_id: int) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="💬 Ответить менеджеру", callback_data=f"client_reply_mgr_{client_id}", style="primary")],
+          [InlineKeyboardButton(text="🔒 Закрыть обращение", callback_data=f"client_close_thr_{client_id}", style="danger")],
+      ]
+  )
+
+
+def _staff_ticket_keyboard(client_id: int, ticket_kind: str) -> InlineKeyboardMarkup:
+  return InlineKeyboardMarkup(
+      inline_keyboard=[
+          [
+              InlineKeyboardButton(
+                  text="💬 Ответить",
+                  callback_data=f"staff_ans_ticket_{ticket_kind}_{client_id}",
+                  style="primary",
+              ),
+              InlineKeyboardButton(
+                  text="🔒 Закрыть обращение",
+                  callback_data=f"staff_close_ticket_{ticket_kind}_{client_id}",
+                  style="danger",
+              ),
+          ]
+      ]
+  )
+
+
+async def _auto_close_send_thread(bot: Bot, client_id: int, delay_seconds: float = 3600.0):
+  try:
+    await asyncio.sleep(delay_seconds)
+    thread = ACTIVE_SEND_THREADS.get(client_id)
+    if not thread or thread.get("closed"):
+      return
+    thread["closed"] = True
+    ACTIVE_SEND_THREADS.pop(client_id, None)
+    try:
+      await bot.send_message(
+          chat_id=client_id,
+          text="🔒 <b>Обращение автоматически закрыто</b> по истечении 1 часа без активности.",
+          parse_mode="HTML",
+      )
+    except Exception as e:
+      logger.warning(f"Не удалось отправить уведомление об автозакрытии треда ({client_id}): {e}")
+  except asyncio.CancelledError:
+    pass
+
+
+async def _activate_send_thread(bot: Bot, client_id: int):
+  old = ACTIVE_SEND_THREADS.pop(client_id, None)
+  if old and old.get("task"):
+    old["task"].cancel()
+  expires_at = datetime.datetime.now() + datetime.timedelta(hours=1)
+  task = asyncio.create_task(_auto_close_send_thread(bot, client_id, delay_seconds=3600.0))
+  ACTIVE_SEND_THREADS[client_id] = {
+      "task": task,
+      "expires_at": expires_at,
+      "closed": False,
+  }
+
+
+async def _close_send_thread(bot: Bot, client_id: int, notify_client: bool = False, custom_text: str | None = None):
+  thread = ACTIVE_SEND_THREADS.pop(client_id, None)
+  if thread and thread.get("task"):
+    thread["task"].cancel()
+  if notify_client:
+    try:
+      await bot.send_message(
+          chat_id=client_id,
+          text=custom_text or "🔒 <b>Обращение закрыто.</b>",
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+
+
+async def _deliver_to_client_safely(bot: Bot, target_user_id: int, text: str, reply_markup: InlineKeyboardMarkup | None = None):
+  """Надёжная доставка сообщения клиенту с учётом кэша и повторной попыткой при сбое."""
+  if target_user_id not in KNOWN_USERS:
+    KNOWN_USERS[target_user_id] = datetime.datetime.now()
+  try:
+    return await bot.send_message(
+        chat_id=target_user_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
+  except Exception:
+    await asyncio.sleep(0.4)
+    return await bot.send_message(
+        chat_id=target_user_id,
+        text=text,
+        reply_markup=reply_markup,
+        parse_mode="HTML",
+    )
 
 
 def _build_catalog_keyboard() -> InlineKeyboardMarkup:
@@ -1153,6 +1463,12 @@ async def cmd_manager_bill(message: Message):
     )
     return
 
+  if is_pure_manager(message.from_user.id):
+    forbidden_reason = _check_manager_forbidden_requisites(args[1])
+    if forbidden_reason:
+      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
+      return
+
   parts = args[1].strip().split()
   if len(parts) < 2 or not parts[0].isdigit():
     await message.reply("❌ Неверный формат. Пример: `/bill 282810030 особый заказ 220$`", parse_mode="Markdown")
@@ -1186,11 +1502,11 @@ async def cmd_manager_bill(message: Message):
       f"Выберите способ оплаты ниже, чтобы получить реквизиты:"
   )
   try:
-    await message.bot.send_message(
-        chat_id=target_user_id,
+    await _deliver_to_client_safely(
+        message.bot,
+        target_user_id=target_user_id,
         text=bill_text,
         reply_markup=_build_payment_keyboard(),
-        parse_mode="HTML",
     )
     await message.reply(
         f"✅ Счет на <b>{service_name}</b> (<b>{price_str} USDT</b>) отправлен пользователю <code>{target_user_id}</code>.",
@@ -1205,28 +1521,286 @@ async def cmd_manager_send(message: Message):
   if not is_manager_authorized(message.from_user.id):
     return
   args = message.text.split(maxsplit=2)
-  if len(args) < 3 or not args[1].strip().isdigit():
+  if len(args) < 3:
     await message.reply(
-        "❌ Использование: `/send <user_id> <сообщение>`\nПример: `/send 282810030 Привет! Счет готов.`",
+        "❌ Использование: `/send <user_id или @username> <сообщение>`\nПример: `/send 282810030 Привет! Счет готов.`",
         parse_mode="Markdown",
     )
     return
 
-  target_user_id = int(args[1].strip())
+  target_user_id = _resolve_user_target(args[1].strip())
+  if not target_user_id:
+    await message.reply("❌ Неверный ID или @username пользователя.")
+    return
+
   out_text = args[2].strip()
   if not out_text:
     await message.reply("❌ Сообщение не может быть пустым.")
     return
 
+  if is_pure_manager(message.from_user.id):
+    forbidden_reason = _check_manager_forbidden_requisites(out_text)
+    if forbidden_reason:
+      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
+      return
+
   try:
-    await message.bot.send_message(
-        chat_id=target_user_id,
+    await _activate_send_thread(message.bot, target_user_id)
+    await _deliver_to_client_safely(
+        message.bot,
+        target_user_id=target_user_id,
         text=f"💬 <b>Сообщение от менеджера:</b>\n\n{out_text}",
-        parse_mode="HTML",
+        reply_markup=_client_send_thread_keyboard(target_user_id),
     )
     await message.reply(f"✅ Сообщение отправлено пользователю <code>{target_user_id}</code>.", parse_mode="HTML")
   except Exception as e:
     await message.reply(f"❌ Ошибка отправки пользователю <code>{target_user_id}</code>: {e}", parse_mode="HTML")
+
+
+# === КНОПКИ КЛИЕНТА ПОД /send И ОБРАТНАЯ СВЯЗЬ МЕНЕДЖЕРУ ===
+@router.callback_query(F.data.startswith("client_reply_mgr_"))
+async def cb_client_reply_to_manager(callback: CallbackQuery, state: FSMContext):
+  try:
+    client_id = int(callback.data.split("_")[-1])
+  except ValueError:
+    return
+  if callback.from_user.id != client_id:
+    await callback.answer("Эта кнопка не для вас.", show_alert=True)
+    return
+
+  thread = ACTIVE_SEND_THREADS.get(client_id)
+  if not thread or thread.get("closed"):
+    await callback.answer("Обращение уже закрыто.", show_alert=True)
+    return
+
+  await callback.answer()
+  await state.set_state(ClientThreadReplyForm.waiting_reply)
+  await state.update_data(reply_thread_client_id=client_id)
+  kb = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="🔒 Закрыть обращение", callback_data=f"client_close_thr_{client_id}", style="danger")]
+      ]
+  )
+  await callback.message.reply(
+      "✍️ Напишите ваш вопрос или сообщение менеджеру (можно прикрепить фото):",
+      reply_markup=kb,
+  )
+
+
+@router.message(ClientThreadReplyForm.waiting_reply, F.text | F.photo)
+async def process_client_thread_reply(message: Message, state: FSMContext):
+  await track_user(message.from_user)
+  client_id = message.from_user.id
+  thread = ACTIVE_SEND_THREADS.get(client_id)
+  if not thread or thread.get("closed"):
+    await state.clear()
+    await message.reply("🔒 Это обращение уже закрыто.")
+    return
+
+  # Продлеваем таймер автозакрытия на 1 час при активности клиента
+  await _activate_send_thread(message.bot, client_id)
+
+  user_badge = _format_user_badge(client_id, message.from_user.username)
+  body_text = (message.caption or message.text or "").strip()
+  header = (
+      f"📩 <b>Ответ клиента по /send</b>\n"
+      f"• От кого: {user_badge}\n"
+      f"• Сообщение: {body_text if body_text else '<i>[Фото]</i>'}"
+  )
+  staff_kb = _staff_ticket_keyboard(client_id, "send")
+
+  for uid in _get_staff_notify_ids():
+    try:
+      if message.photo:
+        await message.bot.send_photo(
+            chat_id=uid,
+            photo=message.photo[-1].file_id,
+            caption=header,
+            reply_markup=staff_kb,
+            parse_mode="HTML",
+        )
+      else:
+        await message.bot.send_message(
+            chat_id=uid,
+            text=header,
+            reply_markup=staff_kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+      logger.warning(f"Не удалось переслать ответ клиента ({uid}): {e}")
+
+  await state.clear()
+  await message.reply("✅ Ваше сообщение отправлено менеджеру.")
+
+
+@router.callback_query(F.data.startswith("client_close_thr_"))
+async def cb_client_close_send_thread(callback: CallbackQuery, state: FSMContext):
+  try:
+    client_id = int(callback.data.split("_")[-1])
+  except ValueError:
+    return
+  if callback.from_user.id != client_id:
+    await callback.answer("Эта кнопка не для вас.", show_alert=True)
+    return
+
+  await _close_send_thread(callback.bot, client_id, notify_client=False)
+  for uid in _get_staff_notify_ids():
+    try:
+      await callback.bot.send_message(
+          chat_id=uid,
+          text=f"🔒 Клиент {_format_user_badge(client_id, callback.from_user.username)} закрыл обращение по /send.",
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+
+  await callback.answer("Обращение закрыто.")
+  await show_main_menu(callback, state)
+
+
+# === МЕНЮ ТИКЕТОВ У МЕНЕДЖЕРА / АДМИНА (ПОДДЕРЖКА / ОСОБЫЙ ЗАКАЗ / ОПЛАТА / /send) ===
+@router.callback_query(F.data.startswith("staff_ans_ticket_"))
+async def cb_staff_answer_ticket(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  parts = callback.data.split("_")
+  # формат: staff_ans_ticket_{kind}_{client_id}
+  if len(parts) < 5:
+    return
+  kind = parts[3]
+  try:
+    client_id = int(parts[4])
+  except ValueError:
+    return
+
+  await callback.answer()
+  await state.set_state(StaffQuickReplyForm.waiting_reply)
+  await state.update_data(target_client_id=client_id, ticket_kind=kind)
+  await callback.message.reply(
+      f"✍️ Введите ответ клиенту <code>{client_id}</code> одним сообщением (или отправьте /cancel для отмены):",
+      parse_mode="HTML",
+  )
+
+
+@router.message(StaffQuickReplyForm.waiting_reply, Command("cancel"))
+async def cmd_cancel_staff_reply(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  await state.clear()
+  await message.reply("❌ Ответ отменён.")
+
+
+@router.message(StaffQuickReplyForm.waiting_reply, F.text)
+async def process_staff_quick_reply(message: Message, state: FSMContext):
+  if not is_manager_authorized(message.from_user.id):
+    return
+  data = await state.get_data()
+  target_client_id = data.get("target_client_id")
+  kind = data.get("ticket_kind") or "support"
+  reply_text = message.text.strip()
+
+  if not target_client_id:
+    await state.clear()
+    await message.reply("❌ Не найден ID клиента.")
+    return
+
+  if is_pure_manager(message.from_user.id):
+    forbidden_reason = _check_manager_forbidden_requisites(reply_text)
+    if forbidden_reason:
+      await message.reply(f"❌ Отправка запрещена: {forbidden_reason}.")
+      return
+
+  try:
+    if kind == "send":
+      await _activate_send_thread(message.bot, int(target_client_id))
+      await _deliver_to_client_safely(
+          message.bot,
+          target_user_id=int(target_client_id),
+          text=f"💬 <b>Сообщение от менеджера:</b>\n\n{reply_text}",
+          reply_markup=_client_send_thread_keyboard(int(target_client_id)),
+      )
+    else:
+      await _deliver_to_client_safely(
+          message.bot,
+          target_user_id=int(target_client_id),
+          text=f"💬 <b>Сообщение от службы поддержки:</b>\n\n{reply_text}",
+      )
+    await state.clear()
+    await message.reply(f"✅ Ответ отправлен клиенту <code>{target_client_id}</code>.", parse_mode="HTML")
+  except Exception as e:
+    await message.reply(f"❌ Ошибка отправки клиенту <code>{target_client_id}</code>: {e}", parse_mode="HTML")
+
+
+@router.callback_query(F.data.startswith("staff_close_ticket_"))
+async def cb_staff_close_ticket(callback: CallbackQuery):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  parts = callback.data.split("_")
+  # формат: staff_close_ticket_{kind}_{client_id}
+  if len(parts) < 5:
+    return
+  kind = parts[3]
+  try:
+    client_id = int(parts[4])
+  except ValueError:
+    return
+
+  CLOSED_TICKETS.add((client_id, kind))
+  if kind == "send":
+    await _close_send_thread(callback.bot, client_id, notify_client=True)
+  else:
+    try:
+      await callback.bot.send_message(
+          chat_id=client_id,
+          text="🔒 <b>Ваше обращение закрыто.</b> Если появятся новые вопросы — напишите нам снова.",
+          parse_mode="HTML",
+      )
+    except Exception:
+      pass
+
+  await callback.answer("Обращение закрыто.")
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  await callback.message.reply(f"🔒 Обращение клиента <code>{client_id}</code> закрыто.", parse_mode="HTML")
+
+
+# === КНОПКИ УПРАВЛЕНИЯ НЕОПЛАЧЕННЫМИ ЗАКАЗАМИ У МЕНЕДЖЕРА / АДМИНА ===
+@router.callback_query(F.data.startswith("staff_reply_unpaid_"))
+async def cb_staff_reply_unpaid(callback: CallbackQuery, state: FSMContext):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  try:
+    client_id = int(callback.data.split("_")[-1])
+  except ValueError:
+    return
+  await callback.answer()
+  await state.set_state(StaffQuickReplyForm.waiting_reply)
+  await state.update_data(target_client_id=client_id, ticket_kind="unpaid")
+  await callback.message.reply(
+      f"✍️ Введите сообщение для клиента <code>{client_id}</code> по неоплаченному заказу (или /cancel):",
+      parse_mode="HTML",
+  )
+
+
+@router.callback_query(F.data.startswith("staff_cancel_unpaid_"))
+async def cb_staff_cancel_unpaid(callback: CallbackQuery):
+  if not is_manager_authorized(callback.from_user.id):
+    return
+  try:
+    client_id = int(callback.data.split("_")[-1])
+  except ValueError:
+    return
+  _cancel_unpaid_followup(client_id)
+  PENDING_BILLS.pop(client_id, None)
+  await delete_pending_bill_db(client_id)
+  await callback.answer("Отменено.")
+  try:
+    await callback.message.edit_reply_markup(reply_markup=None)
+  except Exception:
+    pass
+  await callback.message.reply(f"❌ Неоплаченный заказ / лид клиента <code>{client_id}</code> отменён.", parse_mode="HTML")
 
 
 @router.message(Command("work"))
@@ -1775,6 +2349,7 @@ async def cmd_order(message: Message, state: FSMContext):
   user_id = message.from_user.id
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
+  await track_client_step(message.bot, message.from_user, "catalog")
   await state.set_state(OrderForm.service)
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
   await render_step(message, state, "catalog.jpg", text, _build_catalog_keyboard())
@@ -1894,25 +2469,33 @@ async def process_support_reason(message: Message, state: FSMContext):
   await render_step(message, state, "support.jpg", text, keyboard)
 
 
+async def _send_support_ticket_to_staff(bot: Bot, user, reason_text: str, photo_id: str | None = None):
+  user_badge = _format_user_badge(user.id, user.username)
+  journey_summary = _build_client_journey_summary(user.id)
+  ticket_text = (
+      f"📩 <b>Новое обращение в поддержку</b>\n\n"
+      f"• От кого: {user_badge}\n"
+      f"• Вопрос: {reason_text}\n\n"
+      f"{journey_summary}"
+  )
+  kb = _staff_ticket_keyboard(user.id, "support")
+  for uid in _get_staff_notify_ids():
+    try:
+      if photo_id:
+        await bot.send_photo(chat_id=uid, photo=photo_id, caption=ticket_text, reply_markup=kb, parse_mode="HTML")
+      else:
+        await bot.send_message(chat_id=uid, text=ticket_text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+      logger.error(f"Ошибка отправки обращения в поддержку ({uid}): {e}")
+
+
 @router.message(SupportForm.photo, F.photo)
 async def process_support_photo(message: Message, state: FSMContext):
   await track_user(message.from_user)
   photo_id = message.photo[-1].file_id
   data = await state.get_data()
-  user = message.from_user
-  user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
   reason_text = data.get("reason") or "Без описания"
-  admin_text = (
-      f"📩 <b>Новое обращение в поддержку</b>\n\n"
-      f"• От кого: {user_info} (<code>{user.id}</code>)\n"
-      f"• Вопрос: {reason_text}"
-  )
-  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  for uid in notify_ids:
-    try:
-      await message.bot.send_photo(chat_id=uid, photo=photo_id, caption=admin_text, parse_mode="HTML")
-    except Exception:
-      pass
+  await _send_support_ticket_to_staff(message.bot, message.from_user, reason_text, photo_id=photo_id)
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
@@ -1921,28 +2504,32 @@ async def process_support_photo(message: Message, state: FSMContext):
   await state.clear()
 
 
+@router.message(SupportForm.photo, F.text)
+async def process_support_photo_text_fallback(message: Message, state: FSMContext):
+  """Если пользователь в шаге фото написал текст вместо фото — дописываем его к обращению и отправляем."""
+  await track_user(message.from_user)
+  data = await state.get_data()
+  prev_reason = data.get("reason") or ""
+  extra = message.text.strip()
+  combined = f"{prev_reason}\n{extra}".strip() if prev_reason else extra
+  await _send_support_ticket_to_staff(message.bot, message.from_user, combined, photo_id=None)
+  text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
+  )
+  await state.clear()
+  await render_step(message, state, "main.jpg", text, keyboard)
+
+
 @router.callback_query(SupportForm.photo, F.data == "skip_support_photo")
 async def skip_support_photo(callback: CallbackQuery, state: FSMContext):
   await track_user(callback.from_user)
   data = await state.get_data()
-  user = callback.from_user
-  user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
   reason_text = (
       data.get("reason")
       or (callback.message.caption if callback.message and callback.message.caption else "Обращение без текста")
   )
-  admin_text = (
-      f"📩 <b>Новое обращение в поддержку</b>\n\n"
-      f"• От кого: {user_info} (<code>{user.id}</code>)\n"
-      f"• Вопрос: {reason_text}"
-  )
-  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  for uid in notify_ids:
-    try:
-      await callback.bot.send_message(chat_id=uid, text=admin_text, parse_mode="HTML")
-    except Exception as e:
-      logger.error(f"Ошибка отправки обращения в поддержку ({uid}): {e}")
-
+  await _send_support_ticket_to_staff(callback.bot, callback.from_user, reason_text, photo_id=None)
   text = "✅ Обращение отправлено! Специалист скоро свяжется с вами."
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
@@ -1959,6 +2546,7 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user_id)
+  await track_client_step(callback.bot, callback.from_user, "catalog")
 
   await state.set_state(OrderForm.service)
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
@@ -1970,6 +2558,7 @@ async def process_special_order_service(callback: CallbackQuery, state: FSMConte
   service_name = "Особый заказ — Рассчитать стоимость"
   await state.update_data(service_name=service_name, total_price=0)
   await state.set_state(OrderForm.target_username)
+  await track_client_step(callback.bot, callback.from_user, "service_selected", service_name=service_name, price=0)
 
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
@@ -1990,6 +2579,7 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
 
   await state.update_data(service_name=service_name, total_price=price)
   await state.set_state(OrderForm.target_username)
+  await track_client_step(callback.bot, callback.from_user, "service_selected", service_name=service_name, price=price)
 
   link_services = ["снос сайта", "снос tg канала или бота", "ddos-атака сайта", "слив базы сайта"]
   if service_name.lower() in link_services:
@@ -2015,8 +2605,17 @@ async def process_target_username(message: Message, state: FSMContext):
   price = data.get("total_price", 0)
 
   if not price:
-    await state.update_data(special_task=message.text.strip())
+    special_task_text = message.text.strip()
+    await state.update_data(special_task=special_task_text)
     await state.set_state(OrderForm.special_link)
+    await track_client_step(
+        message.bot,
+        message.from_user,
+        "target_entered",
+        service_name=data.get("service_name"),
+        price=0,
+        target=special_task_text,
+    )
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="catalog_services", style="danger")]]
     )
@@ -2028,8 +2627,17 @@ async def process_target_username(message: Message, state: FSMContext):
     await render_step(message, state, "target_data.jpg", text, keyboard)
     return
 
-  await state.update_data(target_username=message.text.strip())
+  target_val = message.text.strip()
+  await state.update_data(target_username=target_val)
   updated_data = await state.get_data()
+  await track_client_step(
+      message.bot,
+      message.from_user,
+      "summary",
+      service_name=updated_data.get("service_name"),
+      price=price,
+      target=target_val,
+  )
   summary_text = (
       "✨ <b>Сводка заказа:</b>\n\n"
       f"• Услуга: <b>{updated_data.get('service_name')}</b>\n"
@@ -2052,22 +2660,29 @@ async def process_special_order_link(message: Message, state: FSMContext):
   data = await state.get_data()
   task_desc = data.get("special_task", "")
   user = message.from_user
-  user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+  user_badge = _format_user_badge(user.id, user.username)
+  await track_client_step(
+      message.bot,
+      user,
+      "target_entered",
+      service_name=data.get("service_name") or "Особый заказ",
+      price=0,
+      target=f"{task_desc} | {link}",
+  )
+  journey_summary = _build_client_journey_summary(user.id)
 
-  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  for uid in notify_ids:
+  ticket_text = (
+      f"🛠 <b>Заявка на особый заказ (Рассчитать стоимость)</b>\n\n"
+      f"• Клиент: {user_badge}\n"
+      f"• Задача: {task_desc}\n"
+      f"• Ссылка: {link}\n\n"
+      f"{journey_summary}\n\n"
+      f"Выставить счёт: <code>/bill {user.id} особый заказ 220$</code>"
+  )
+  kb = _staff_ticket_keyboard(user.id, "special")
+  for uid in _get_staff_notify_ids():
     try:
-      await message.bot.send_message(
-          chat_id=uid,
-          text=(
-              f"🛠 <b>Заявка на особый заказ (Рассчитать стоимость)</b>\n\n"
-              f"• Клиент: {user_info} (<code>{user.id}</code>)\n"
-              f"• Задача: {task_desc}\n"
-              f"• Ссылка: {link}\n\n"
-              f"Выставить счёт: <code>/bill {user.id} особый заказ 220$</code>"
-          ),
-          parse_mode="HTML",
-      )
+      await message.bot.send_message(chat_id=uid, text=ticket_text, reply_markup=kb, parse_mode="HTML")
     except Exception:
       pass
 
@@ -2084,6 +2699,14 @@ async def process_go_to_payment(callback: CallbackQuery, state: FSMContext):
   user_id = callback.from_user.id
   ctx = await _get_payment_context(user_id, state)
   total_price = ctx["total_price"]
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "payment_menu",
+      service_name=ctx["service_name"],
+      price=total_price,
+      target=ctx["target_username"],
+  )
 
   if user_id in ABANDONED_CHECKOUTS:
     task = ABANDONED_CHECKOUTS.pop(user_id, None)
@@ -2113,6 +2736,14 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
 
   ctx = await _get_payment_context(callback.from_user.id, state)
   total_price = ctx["total_price"]
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "payment_method_selected",
+      service_name=ctx["service_name"],
+      price=total_price,
+      target=ctx["target_username"],
+  )
   rate = await get_exchange_rate(curr_code)
   local_amount = round(total_price * rate)
 
@@ -2154,15 +2785,18 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
 
 @router.callback_query(F.data == "payment_help_manager")
 async def process_payment_help_manager(callback: CallbackQuery):
-  notify_ids = {uid for uid in (ADMIN_ID, MANAGER_ID) if uid}
-  for uid in notify_ids:
+  user = callback.from_user
+  user_badge = _format_user_badge(user.id, user.username)
+  journey_summary = _build_client_journey_summary(user.id)
+  help_text = (
+      f"🚨 <b>Проблема / запрос помощи с оплатой</b>\n\n"
+      f"• Клиент: {user_badge}\n\n"
+      f"{journey_summary}"
+  )
+  kb = _staff_ticket_keyboard(user.id, "payment")
+  for uid in _get_staff_notify_ids():
     try:
-      user = callback.from_user
-      await callback.bot.send_message(
-          chat_id=uid,
-          text=f"🚨 Запрос помощи с оплатой от @{user.username} (<code>{user.id}</code>)",
-          parse_mode="HTML",
-      )
+      await callback.bot.send_message(chat_id=uid, text=help_text, reply_markup=kb, parse_mode="HTML")
     except Exception:
       pass
   await callback.answer("✅ Менеджер уведомлен, скоро свяжется с вами.", show_alert=True)
@@ -2172,6 +2806,14 @@ async def process_payment_help_manager(callback: CallbackQuery):
 async def process_pay_cryptobot(callback: CallbackQuery, state: FSMContext):
   ctx = await _get_payment_context(callback.from_user.id, state)
   total_price = ctx["total_price"]
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "payment_method_selected",
+      service_name=ctx["service_name"],
+      price=total_price,
+      target=ctx["target_username"],
+  )
 
   pay_url, inv_id = await create_cryptobot_invoice(total_price, "Оплата услуг")
   if not pay_url:
@@ -2205,6 +2847,7 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
     return
 
   user = callback.from_user
+  _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
@@ -2270,6 +2913,14 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
 
   ctx = await _get_payment_context(callback.from_user.id, state)
   total_price = ctx["total_price"]
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "payment_method_selected",
+      service_name=ctx["service_name"],
+      price=total_price,
+      target=ctx["target_username"],
+  )
   wallet = get_next_crypto_wallet(net_key)
 
   if not wallet:
@@ -2308,6 +2959,14 @@ async def process_pay_crypto(callback: CallbackQuery, state: FSMContext):
 async def ask_for_receipt(callback: CallbackQuery, state: FSMContext):
   await state.set_state(OrderForm.receipt)
   ctx = await _get_payment_context(callback.from_user.id, state)
+  await track_client_step(
+      callback.bot,
+      callback.from_user,
+      "receipt_requested",
+      service_name=ctx["service_name"],
+      price=ctx["total_price"],
+      target=ctx["target_username"],
+  )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="go_to_payment", style="danger")]]
   )
@@ -2321,6 +2980,7 @@ async def ask_for_receipt(callback: CallbackQuery, state: FSMContext):
 @router.message(OrderForm.receipt, F.photo)
 async def process_receipt_photo(message: Message, state: FSMContext):
   user = message.from_user
+  _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
@@ -2369,6 +3029,7 @@ async def process_receipt_document(message: Message, state: FSMContext):
     return
 
   user = message.from_user
+  _cancel_unpaid_followup(user.id)
   task = ABANDONED_CHECKOUTS.pop(user.id, None)
   if task:
     task.cancel()
