@@ -85,6 +85,8 @@ ACTIVE_SEND_THREADS = {}  # client_id -> {"task": asyncio.Task, "expires_at": da
 CLIENT_JOURNEY = {}  # user_id -> dict
 UNPAID_FOLLOWUP_TASKS = {}  # user_id -> asyncio.Task
 CLOSED_TICKETS = set()  # (client_id, ticket_kind)
+UNPAID_ALERT_COUNTER = 0
+UNPAID_ALERT_SENT_KEYS = set()  # (user_id, trigger_key)
 
 STEP_RANK = {
     "catalog": 1,
@@ -97,13 +99,13 @@ STEP_RANK = {
 }
 
 STEP_LABELS = {
-    "catalog": "Каталог услуг",
-    "service_selected": "Выбор услуги / описание задачи",
-    "target_entered": "Ввод данных цели / ссылки",
-    "summary": "Сводка заказа",
-    "payment_menu": "Переход к оплате",
-    "payment_method_selected": "Выбор способа / валюты / сети оплаты",
-    "receipt_requested": "Ожидание отправки чека",
+    "catalog": "1. Каталог услуг",
+    "service_selected": "2. Выбор услуги / описание задачи",
+    "target_entered": "3. Ввод данных цели / ссылки",
+    "summary": "4. Сводка заказа",
+    "payment_menu": "5. Переход к оплате",
+    "payment_method_selected": "10. Выбор способа оплаты / реквизитов",
+    "receipt_requested": "11. Ожидание отправки чека",
 }
 
 router = Router()
@@ -310,7 +312,6 @@ async def load_persistent_state(bot: Bot | None = None):
           except Exception:
             pass
 
-      # Подгружаем ID и никнеймы из заказов на случай если в users не было записи
       o_u_rows = await conn.fetch("SELECT DISTINCT user_id FROM orders WHERE user_id IS NOT NULL")
       for r in o_u_rows:
         uid = int(r["user_id"])
@@ -762,9 +763,10 @@ async def _purge_user_active_processes(bot: Bot, user_id: int):
   PENDING_BILLS.pop(user_id, None)
   await delete_pending_bill_db(user_id)
 
-  # Удаляем закрытые тикеты и записи воронки/проблемных веток для забаненного
   for key in [k for k in CLOSED_TICKETS if k[0] == user_id]:
     CLOSED_TICKETS.discard(key)
+  for key in [k for k in UNPAID_ALERT_SENT_KEYS if k[0] == user_id]:
+    UNPAID_ALERT_SENT_KEYS.discard(key)
   journey = CLIENT_JOURNEY.get(user_id)
   if journey is not None:
     journey["problem_kind"] = None
@@ -1000,7 +1002,6 @@ _LINK_PATTERN = re.compile(
 
 def _compact_text_for_requisites(text: str) -> str:
   """Убирает лишние пробелы и разделители между символами для защиты от обхода фильтра."""
-  # Сжимаем пробелы и разделители между цифрами/символами
   compact = re.sub(r"[\s\u00a0\u200b\u200c\u200d\ufeff.,_/*|\\~`'\";:()\[\]{}<>-]+", "", text)
   return compact
 
@@ -1039,18 +1040,111 @@ def _check_manager_forbidden_requisites(text: str) -> str | None:
 
 # === ОТСЛЕЖИВАНИЕ ШАГОВ КЛИЕНТА И НЕОПЛАЧЕННЫХ ЗАКАЗОВ ===
 async def _has_unpaid_order_or_bill(user_id: int) -> bool:
-  """Проверяет именно текущий неоплаченный счёт или незавершённый заказ, а не историю старых заказов."""
+  """Проверяет наличие незавершённого заказа / счёта / выбранного пункта каталога без оплаты."""
   if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
     return False
   if user_id in PENDING_BILLS:
     return True
   journey = CLIENT_JOURNEY.get(user_id)
-  if journey and journey.get("has_unpaid_active"):
+  if journey and (journey.get("has_unpaid_active") or journey.get("service_selected")):
     return True
   return False
 
 
-async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 900.0):
+def _next_unpaid_ticket_number() -> int:
+  global UNPAID_ALERT_COUNTER
+  UNPAID_ALERT_COUNTER += 1
+  return UNPAID_ALERT_COUNTER
+
+
+def _build_unpaid_screenshot_message(user_id: int, ticket_num: int, reason_note: str | None = None) -> str:
+  j = CLIENT_JOURNEY.get(user_id) or {}
+  pending_bill = PENDING_BILLS.get(user_id)
+  uname = j.get("username") or USER_MAPPING.get(user_id)
+  client_handle = f"@{uname.lstrip('@')}" if uname else f"ID: <code>{user_id}</code>"
+
+  orders_count = 0
+  try:
+    with sqlite3.connect("bot_database.db") as conn:
+      row = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (user_id,)).fetchone()
+      if row:
+        orders_count = int(row[0])
+  except Exception:
+    pass
+
+  srv = pending_bill["service_name"] if pending_bill else (j.get("service_name") or "Не выбрана")
+  price_val = pending_bill["total_price"] if pending_bill else j.get("price", 0)
+  price_str = f"{_format_price(price_val)}$" if price_val else "Не указана"
+  stage_str = j.get("step_label") or STEP_LABELS.get(j.get("step") or "catalog", "1. Каталог услуг")
+  order_status_str = "Выставлен счёт" if pending_bill else (j.get("order_status") or "Не оплачен")
+  first_seen_str = j.get("first_seen") or datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+  last_active_dt = KNOWN_USERS.get(user_id)
+  activity_str = last_active_dt.strftime("%d.%m.%Y %H:%M") if last_active_dt else datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+  country_str = j.get("country") or "—"
+
+  lines = [
+      "⚠️ <b>Неоплаченный заказ — требуется ведение клиента</b>",
+      f"📦 Обращение #{ticket_num} | Статус: 🟢 <b>Открыто</b>",
+      "",
+      f"• Клиент: {client_handle} (ID: <code>{user_id}</code>)",
+      "• Статус: текущий заказ или счёт не оплачен.",
+      "• Рекомендация: проведите клиента дальше по оплате или свяжитесь с ним.",
+  ]
+  if reason_note:
+    lines.append(f"• Причина: {reason_note}")
+
+  lines.extend([
+      "",
+      "📋 <b>Сводка по клиенту и заказу:</b>",
+      f"• Клиент: {client_handle} | ID: <code>{user_id}</code>",
+      f"• Услуга: <b>{srv}</b>",
+      f"• Этап: <b>{stage_str}</b> | Статус заказа: 🧾 <b>{order_status_str}</b>",
+      f"• Первый вход: <b>{first_seen_str}</b> | Активность: <b>{activity_str}</b>",
+      f"• Заказов в истории: <b>{orders_count}</b>",
+      f"• Страна: <b>{country_str}</b>",
+      f"• Сумма: <b>{price_str}</b>",
+  ])
+  return "\n".join(lines)
+
+
+async def _send_unpaid_order_manager_alert(
+    bot: Bot,
+    user_id: int,
+    trigger_key: str,
+    reason_note: str | None = None,
+):
+  """Отправляет уведомление о неоплаченном заказе менеджеру и админу по формату со скриншота."""
+  if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+    return
+  if (user_id, "unpaid") in CLOSED_TICKETS:
+    return
+  dedup_key = (user_id, trigger_key)
+  if dedup_key in UNPAID_ALERT_SENT_KEYS:
+    return
+
+  j = CLIENT_JOURNEY.get(user_id) or {}
+  if not (j.get("catalog_reached") or j.get("service_selected") or j.get("has_unpaid_active") or user_id in PENDING_BILLS):
+    return
+
+  UNPAID_ALERT_SENT_KEYS.add(dedup_key)
+  j["problem_kind"] = "unpaid"
+  j["has_unpaid_active"] = True
+  await _activate_send_thread(bot, user_id, kind="unpaid")
+
+  ticket_num = _next_unpaid_ticket_number()
+  msg_text = _build_unpaid_screenshot_message(user_id, ticket_num=ticket_num, reason_note=reason_note)
+  kb = _staff_order_or_special_keyboard(user_id, "unpaid")
+
+  for uid in _get_staff_notify_ids():
+    try:
+      if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
+        return
+      await bot.send_message(chat_id=uid, text=msg_text, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+      logger.warning(f"Не удалось отправить уведомление о неоплаченном заказе ({uid}): {e}")
+
+
+async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 600.0):
   try:
     if delay_seconds > 0:
       await asyncio.sleep(delay_seconds)
@@ -1062,24 +1156,14 @@ async def _unpaid_followup_job(bot: Bot, user_id: int, delay_seconds: float = 90
     if not await _has_unpaid_order_or_bill(user_id):
       return
 
-    journey = CLIENT_JOURNEY.get(user_id)
-    if not journey or journey.get("step_rank", 0) < STEP_RANK["summary"]:
-      return
-
-    summary_card = _build_client_journey_summary(user_id)
-    msg_text = (
-        f"⚠️ <b>Неоплаченный заказ (клиент остановился на этапе: {journey.get('step_label')})</b>\n\n"
-        f"{summary_card}\n\n"
-        f"💡 Проведите клиента дальше: напишите ему, выставьте счёт или закройте/отмените обращение."
+    journey = CLIENT_JOURNEY.get(user_id) or {}
+    stage_label = journey.get("step_label") or "Этап оплаты"
+    await _send_unpaid_order_manager_alert(
+        bot=bot,
+        user_id=user_id,
+        trigger_key=f"timeout_10m_{journey.get('step') or 'payment'}",
+        reason_note=f"прошло 10 минут на этапе «{stage_label}», оплата не поступила.",
     )
-    kb = _staff_order_or_special_keyboard(user_id, "unpaid")
-    for uid in _get_staff_notify_ids():
-      try:
-        if await is_user_banned(user_id, USER_MAPPING.get(user_id)):
-          return
-        await bot.send_message(chat_id=uid, text=msg_text, reply_markup=kb, parse_mode="HTML")
-      except Exception as e:
-        logger.warning(f"Не удалось отправить уведомление о неоплаченном заказе ({uid}): {e}")
   except asyncio.CancelledError:
     pass
 
@@ -1090,10 +1174,32 @@ def _cancel_unpaid_followup(user_id: int):
     task.cancel()
 
 
-def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 900.0):
+def _schedule_unpaid_followup(bot: Bot, user_id: int, delay_seconds: float = 600.0):
   _cancel_unpaid_followup(user_id)
   UNPAID_FOLLOWUP_TASKS[user_id] = asyncio.create_task(
       _unpaid_followup_job(bot, user_id, delay_seconds=delay_seconds)
+  )
+
+
+async def _handle_back_navigation_unpaid_alert(bot: Bot, user, from_stage_label: str):
+  """Вызывается при нажатии 'Назад', если клиент уже дошёл до каталога/выбора услуги и не оплатил."""
+  if not user:
+    return
+  uid = user.id
+  if await is_user_banned(uid, user.username):
+    return
+  j = CLIENT_JOURNEY.get(uid) or {}
+  if not (j.get("service_selected") or j.get("has_unpaid_active") or uid in PENDING_BILLS):
+    return
+  if j.get("order_status") in {"✅ Оплачено через CryptoBot", "⏳ Ожидает проверки чека", "⚙️ В работе", "✅ Выполнен"}:
+    return
+  j["has_unpaid_active"] = True
+  j["step_label"] = from_stage_label
+  await _send_unpaid_order_manager_alert(
+      bot=bot,
+      user_id=uid,
+      trigger_key=f"back_from_{from_stage_label}_{j.get('service_name') or ''}",
+      reason_note=f"клиент нажал «Назад» на этапе «{from_stage_label}» без оплаты.",
   )
 
 
@@ -1109,6 +1215,7 @@ async def track_client_step(
     problem_kind: str | None = None,
     problem_query: str | None = None,
     has_unpaid_active: bool | None = None,
+    country: str | None = None,
 ):
   if not user:
     return
@@ -1122,6 +1229,9 @@ async def track_client_step(
   max_rank = max(prev.get("step_rank", 0), rank)
   max_step_key = step_key if rank >= prev.get("step_rank", 0) else prev.get("max_step", step_key)
 
+  catalog_reached = bool(prev.get("catalog_reached")) or (step_key == "catalog") or (rank >= STEP_RANK["catalog"])
+  service_selected = bool(prev.get("service_selected")) or (step_key == "service_selected") or (service_name is not None)
+
   unpaid_flag = has_unpaid_active if has_unpaid_active is not None else prev.get("has_unpaid_active", False)
   if rank >= STEP_RANK["summary"]:
     unpaid_flag = True
@@ -1129,6 +1239,10 @@ async def track_client_step(
   CLIENT_JOURNEY[uid] = {
       "user_id": uid,
       "username": user.username or prev.get("username") or USER_MAPPING.get(uid),
+      "first_seen": prev.get("first_seen") or datetime.datetime.now().strftime("%d.%m.%Y %H:%M"),
+      "country": country if country is not None else prev.get("country", "—"),
+      "catalog_reached": catalog_reached,
+      "service_selected": service_selected,
       "step": step_key,
       "step_label": STEP_LABELS.get(step_key, step_key),
       "max_step": max_step_key,
@@ -1145,8 +1259,8 @@ async def track_client_step(
       "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
   }
 
-  if unpaid_flag and rank >= STEP_RANK["summary"]:
-    _schedule_unpaid_followup(bot, uid, delay_seconds=900.0)
+  if rank >= STEP_RANK["payment_menu"] and unpaid_flag:
+    _schedule_unpaid_followup(bot, uid, delay_seconds=600.0)
 
 
 def _build_client_journey_summary(user_id: int, order_status_override: str | None = None) -> str:
@@ -1276,7 +1390,7 @@ def _staff_order_or_special_keyboard(client_id: int, kind: str = "order") -> Inl
           ],
           [
               InlineKeyboardButton(
-                  text="✍️ Ответить и выставить счёт",
+                  text="💬🧾 Ответить и выставить счёт",
                   callback_data=f"staff_both_ticket_{kind}_{client_id}",
                   style="primary",
               ),
@@ -1425,7 +1539,10 @@ async def _issue_bill_to_client(
     journey["service_name"] = service_name
     journey["price"] = amount
     journey["has_unpaid_active"] = True
+    journey["service_selected"] = True
     journey["order_status"] = "⏳ Ожидает оплаты счёта"
+
+  _schedule_unpaid_followup(bot, target_user_id, delay_seconds=600.0)
 
   price_str = _format_price(amount)
   parts_text = []
@@ -1439,7 +1556,6 @@ async def _issue_bill_to_client(
   )
   bill_text = "\n".join(parts_text)
 
-  # Объединяем кнопки оплаты и кнопки непрерывной переписки
   pay_kb = _build_payment_keyboard()
   thread_kb = _client_send_thread_keyboard(target_user_id)
   combined_rows = list(pay_kb.inline_keyboard) + list(thread_kb.inline_keyboard)
@@ -2150,7 +2266,6 @@ async def process_client_thread_reply(message: Message, state: FSMContext):
     return
 
   ticket_kind = thread.get("kind") or "send"
-  # Продлеваем таймер автозакрытия на 1 час при активности клиента
   await _activate_send_thread(message.bot, client_id, kind=ticket_kind)
 
   user_badge = _format_user_badge(client_id, message.from_user.username)
@@ -2721,7 +2836,6 @@ async def cmd_admin_answer(message: Message):
 async def admin_reply_handler(message: Message, state: FSMContext):
   if not is_admin_authorized(message.from_user.id):
     return
-  # Сбрасываем активный режим ручного ответа конкретному клиенту при ответе реплаем
   await state.clear()
 
   reply_msg = message.reply_to_message
@@ -3241,6 +3355,9 @@ async def back_home(callback: CallbackQuery, state: FSMContext):
   if task:
     task.cancel()
   await delete_abandoned_reminder_db(user_id)
+  cur_step = (CLIENT_JOURNEY.get(user_id) or {}).get("step")
+  if cur_step == "service_selected":
+    await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["service_selected"])
   await show_main_menu(callback, state)
 
 
@@ -3422,6 +3539,7 @@ async def process_start_order(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_to_catalog_keep_data")
 async def back_to_catalog_keep_data(callback: CallbackQuery, state: FSMContext):
   """Возврат в каталог из шага ввода цели/описания с сохранением уже введённых данных в FSM."""
+  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["service_selected"])
   await state.set_state(OrderForm.service)
   await track_client_step(callback.bot, callback.from_user, "catalog")
   text = "🛒 <b>Каталог услуг</b>\n\nВыберите подходящий вариант из списка ниже:"
@@ -3431,12 +3549,14 @@ async def back_to_catalog_keep_data(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_to_special_desc")
 async def back_to_special_desc(callback: CallbackQuery, state: FSMContext):
   """Возврат с шага ссылки особого заказа на шаг описания задачи с сохранением данных."""
+  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["target_entered"])
   await _render_target_step(callback, state)
 
 
 @router.callback_query(F.data == "back_to_target_step")
 async def back_to_target_step(callback: CallbackQuery, state: FSMContext):
   """Возврат со сводки заказа на шаг ввода данных цели с сохранением данных."""
+  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["summary"])
   data = await state.get_data()
   if not data.get("total_price") and data.get("special_task"):
     await _render_special_link_step(callback, state)
@@ -3447,6 +3567,7 @@ async def back_to_target_step(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(F.data == "back_from_payment")
 async def back_from_payment(callback: CallbackQuery, state: FSMContext):
   """Последовательный возврат с экрана оплаты на предыдущий шаг (сводку заказа или каталог)."""
+  await _handle_back_navigation_unpaid_alert(callback.bot, callback.from_user, STEP_LABELS["payment_menu"])
   data = await state.get_data()
   if data.get("service_name") and data.get("target_username"):
     await _render_summary_step(callback, state)
@@ -3472,7 +3593,7 @@ async def process_special_order_service(callback: CallbackQuery, state: FSMConte
       service_name=service_name,
       price=0,
       problem_kind="special",
-      has_unpaid_active=False,
+      has_unpaid_active=True,
   )
   await _render_target_step(callback, state)
 
@@ -3490,7 +3611,7 @@ async def process_service(callback: CallbackQuery, state: FSMContext):
       "service_selected",
       service_name=service_name,
       price=price,
-      has_unpaid_active=False,
+      has_unpaid_active=True,
   )
   await _render_target_step(callback, state)
 
@@ -3514,7 +3635,7 @@ async def process_target_username(message: Message, state: FSMContext):
         special_details=special_task_text,
         problem_kind="special",
         problem_query=special_task_text,
-        has_unpaid_active=False,
+        has_unpaid_active=True,
     )
     await _render_special_link_step(message, state)
     return
@@ -3554,7 +3675,7 @@ async def process_special_order_link(message: Message, state: FSMContext):
       special_details=combined_details,
       problem_kind="special",
       problem_query=task_desc or link,
-      has_unpaid_active=False,
+      has_unpaid_active=True,
   )
   await _activate_send_thread(message.bot, user.id, kind="special")
   journey_summary = _build_client_journey_summary(user.id)
@@ -3633,6 +3754,7 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
       price=total_price,
       target=ctx["target_username"],
       has_unpaid_active=True,
+      country=country,
   )
   rate = await get_exchange_rate(curr_code)
   local_amount = round(total_price * rate)
