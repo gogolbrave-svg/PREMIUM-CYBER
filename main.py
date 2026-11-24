@@ -50,6 +50,7 @@ class OrderForm(StatesGroup):
   service = State()
   target_username = State()
   special_link = State()
+  special_confirm = State()
   receipt = State()
 
 
@@ -2045,6 +2046,27 @@ async def _render_special_link_step(event: Message | CallbackQuery, state: FSMCo
   await render_step(event, state, "target_data.jpg", text, keyboard)
 
 
+async def _render_special_confirm_step(event: Message | CallbackQuery, state: FSMContext):
+  data = await state.get_data()
+  service_name = data.get("service_name") or "Особый заказ — Рассчитать стоимость"
+  task_desc = data.get("special_task") or "—"
+  link = data.get("special_link") or "—"
+  await state.set_state(OrderForm.special_confirm)
+  keyboard = InlineKeyboardMarkup(
+      inline_keyboard=[
+          [InlineKeyboardButton(text="📤 Отправить заявку", callback_data="submit_special_order", style="primary")],
+          [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_special_link", style="danger")],
+      ]
+  )
+  text = (
+      f"🛠 <b>{service_name}</b>\n\n"
+      f"📝 <b>Описание задачи:</b> {task_desc}\n"
+      f"🔗 <b>Ссылка на цель:</b> <code>{link}</code>\n\n"
+      f"Проверьте данные и нажмите кнопку ниже для отправки заявки:"
+  )
+  await render_step(event, state, "summary.jpg", text, keyboard)
+
+
 async def _render_summary_step(event: Message | CallbackQuery, state: FSMContext):
   updated_data = await state.get_data()
   price = updated_data.get("total_price", 0)
@@ -3585,6 +3607,12 @@ async def back_to_special_desc(callback: CallbackQuery, state: FSMContext):
   await _render_target_step(callback, state)
 
 
+@router.callback_query(F.data == "back_to_special_link")
+async def back_to_special_link(callback: CallbackQuery, state: FSMContext):
+  """Возврат с финального подтверждения особого заказа на шаг ссылки с сохранением данных."""
+  await _render_special_link_step(callback, state)
+
+
 @router.callback_query(F.data == "back_to_target_step")
 async def back_to_target_step(callback: CallbackQuery, state: FSMContext):
   """Возврат со сводки заказа на шаг ввода данных цели с сохранением данных."""
@@ -3693,11 +3721,33 @@ async def process_special_order_link(message: Message, state: FSMContext):
   await state.update_data(special_link=link)
   data = await state.get_data()
   task_desc = data.get("special_task", "")
-  user = message.from_user
-  user_badge = _format_user_badge(user.id, user.username)
   combined_details = f"Задача: {task_desc} | Ссылка: {link}"
   await track_client_step(
       message.bot,
+      message.from_user,
+      "target_entered",
+      service_name=data.get("service_name") or "Особый заказ",
+      price=0,
+      target=link,
+      special_details=combined_details,
+      problem_kind="special",
+      problem_query=task_desc or link,
+      has_unpaid_active=True,
+  )
+  await _render_special_confirm_step(message, state)
+
+
+@router.callback_query(OrderForm.special_confirm, F.data == "submit_special_order")
+async def process_submit_special_order(callback: CallbackQuery, state: FSMContext):
+  await track_user(callback.from_user)
+  data = await state.get_data()
+  task_desc = data.get("special_task", "")
+  link = data.get("special_link", "")
+  user = callback.from_user
+  user_badge = _format_user_badge(user.id, user.username)
+  combined_details = f"Задача: {task_desc} | Ссылка: {link}"
+  await track_client_step(
+      callback.bot,
       user,
       "target_entered",
       service_name=data.get("service_name") or "Особый заказ",
@@ -3708,7 +3758,7 @@ async def process_special_order_link(message: Message, state: FSMContext):
       problem_query=task_desc or link,
       has_unpaid_active=True,
   )
-  await _activate_send_thread(message.bot, user.id, kind="special")
+  await _activate_send_thread(callback.bot, user.id, kind="special")
   journey_summary = _build_client_journey_summary(user.id)
 
   ticket_text = (
@@ -3722,7 +3772,7 @@ async def process_special_order_link(message: Message, state: FSMContext):
   kb = _staff_order_or_special_keyboard(user.id, "special")
   for uid in _get_staff_notify_ids():
     try:
-      await message.bot.send_message(chat_id=uid, text=ticket_text, reply_markup=kb, parse_mode="HTML")
+      await callback.bot.send_message(chat_id=uid, text=ticket_text, reply_markup=kb, parse_mode="HTML")
     except Exception:
       pass
 
@@ -3731,7 +3781,7 @@ async def process_special_order_link(message: Message, state: FSMContext):
       inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
   )
   await state.clear()
-  await render_step(message, state, "main.jpg", text, keyboard)
+  await render_step(callback, state, "main.jpg", text, keyboard)
 
 
 @router.callback_query(F.data == "go_to_payment")
