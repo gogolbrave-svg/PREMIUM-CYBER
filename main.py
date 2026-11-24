@@ -2617,7 +2617,8 @@ async def cb_staff_close_ticket(callback: CallbackQuery, state: FSMContext):
   if journey is not None:
     journey["has_unpaid_active"] = False
     journey["problem_kind"] = None
-  await _close_send_thread(callback.bot, client_id, notify_client=(kind != "unpaid"))
+  # Клиент не должен получать уведомление о закрытии обращения ни по одному типу тикета
+  await _close_send_thread(callback.bot, client_id, notify_client=False)
 
   await callback.answer("Обращение закрыто.")
   try:
