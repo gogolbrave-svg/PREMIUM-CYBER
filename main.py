@@ -1818,14 +1818,19 @@ async def get_exchange_rate(target_currency: str) -> float:
 
 
 # === РЕПУТАЦИЯ ===
+REPUTATION_ANCHOR_DATE: datetime.date | None = None
+
+
 def get_reputation_stats():
+  global REPUTATION_ANCHOR_DATE
   current_date = datetime.date.today()
-  base_date = datetime.date(2026, 1, 1)
-  days_passed = max(0, (current_date - base_date).days)
-  completed = 3752 + days_passed * 25
+  if REPUTATION_ANCHOR_DATE is None:
+    REPUTATION_ANCHOR_DATE = current_date
+  days_passed = max(0, (current_date - REPUTATION_ANCHOR_DATE).days)
+  completed = 7248 + days_passed * 237
   rng = random.Random(current_date.toordinal())
-  in_progress = rng.randint(170, 500)
-  new_requests = rng.randint(30, 80)
+  in_progress = rng.randint(104, 238)
+  new_requests = rng.randint(212, 396)
   return completed, in_progress, new_requests
 
 
