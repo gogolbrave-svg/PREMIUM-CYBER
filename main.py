@@ -2054,7 +2054,7 @@ async def _render_special_confirm_step(event: Message | CallbackQuery, state: FS
   await state.set_state(OrderForm.special_confirm)
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
-          [InlineKeyboardButton(text="📤 Отправить заявку", callback_data="submit_special_order", style="primary")],
+          [InlineKeyboardButton(text="✅ Отправить заявку", callback_data="submit_special_order", style="primary")],
           [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_special_link", style="danger")],
       ]
   )
