@@ -64,6 +64,7 @@ PROMO_CODES: dict[str, int] = {
 }
 
 PENDING_PROMO_REQUESTS: dict[str, dict] = {}
+GRANTED_PROMO_DISCOUNTS: dict[int, dict] = {}
 
 
 class OrderForm(StatesGroup):
@@ -213,6 +214,16 @@ def _init_sqlite_db():
     )
     cursor.execute(
         """
+          CREATE TABLE IF NOT EXISTS promo_granted (
+              user_id BIGINT PRIMARY KEY,
+              promo_code TEXT,
+              discount_pct INTEGER,
+              granted_at TEXT
+          )
+      """
+    )
+    cursor.execute(
+        """
           CREATE TABLE IF NOT EXISTS promo_redemptions (
               user_id BIGINT PRIMARY KEY,
               promo_code TEXT,
@@ -323,6 +334,16 @@ async def init_db():
         )
         await conn.execute(
             """
+              CREATE TABLE IF NOT EXISTS promo_granted (
+                  user_id BIGINT PRIMARY KEY,
+                  promo_code TEXT,
+                  discount_pct INTEGER,
+                  granted_at TEXT
+              )
+          """
+        )
+        await conn.execute(
+            """
               CREATE TABLE IF NOT EXISTS promo_redemptions (
                   user_id BIGINT PRIMARY KEY,
                   promo_code TEXT,
@@ -367,6 +388,7 @@ async def load_persistent_state(bot: Bot | None = None):
   KNOWN_USERS.clear()
   LAST_BROADCAST.clear()
   PENDING_PROMO_REQUESTS.clear()
+  GRANTED_PROMO_DISCOUNTS.clear()
 
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
@@ -419,11 +441,22 @@ async def load_persistent_state(bot: Bot | None = None):
         PENDING_BILLS[int(r["user_id"])] = {
             "service_name": r["service_name"],
             "total_price": float(r["total_price"]),
+            "base_price": float(r["total_price"]),
             "target_username": r["target_username"],
         }
 
       rem_rows = await conn.fetch("SELECT user_id, remind_at FROM abandoned_reminders")
       reminders_data = [(int(r["user_id"]), r["remind_at"]) for r in rem_rows]
+
+      pg_rows = await conn.fetch("SELECT user_id, promo_code, discount_pct, granted_at FROM promo_granted")
+      for r in pg_rows:
+        uid = int(r["user_id"])
+        GRANTED_PROMO_DISCOUNTS[uid] = {
+            "user_id": uid,
+            "promo_code": r["promo_code"],
+            "discount_pct": int(r["discount_pct"]),
+            "granted_at": r["granted_at"],
+        }
 
       pr_rows = await conn.fetch(
           """
@@ -499,6 +532,7 @@ async def load_persistent_state(bot: Bot | None = None):
         PENDING_BILLS[int(uid)] = {
             "service_name": sname,
             "total_price": float(price),
+            "base_price": float(price),
             "target_username": tuser,
         }
 
@@ -506,6 +540,17 @@ async def load_persistent_state(bot: Bot | None = None):
           (int(r[0]), r[1])
           for r in cursor.execute("SELECT user_id, remind_at FROM abandoned_reminders").fetchall()
       ]
+
+      for uid, pcode, dpct, gat in cursor.execute(
+          "SELECT user_id, promo_code, discount_pct, granted_at FROM promo_granted"
+      ).fetchall():
+        uid_int = int(uid)
+        GRANTED_PROMO_DISCOUNTS[uid_int] = {
+            "user_id": uid_int,
+            "promo_code": pcode,
+            "discount_pct": int(dpct),
+            "granted_at": gat,
+        }
 
       for row in cursor.execute(
           """
@@ -525,6 +570,14 @@ async def load_persistent_state(bot: Bot | None = None):
             "status": row[7],
             "created_at": row[8],
         }
+
+  for uid, promo_info in list(GRANTED_PROMO_DISCOUNTS.items()):
+    if uid in PENDING_BILLS:
+      base_p = float(PENDING_BILLS[uid].get("base_price") or PENDING_BILLS[uid].get("total_price") or 0)
+      PENDING_BILLS[uid]["base_price"] = base_p
+      PENDING_BILLS[uid]["total_price"] = _calculate_discounted_price(base_p, int(promo_info["discount_pct"]))
+      PENDING_BILLS[uid]["promo_code"] = promo_info["promo_code"]
+      PENDING_BILLS[uid]["discount_pct"] = int(promo_info["discount_pct"])
 
   if bot:
     now = datetime.datetime.now()
@@ -952,7 +1005,7 @@ async def delete_pending_bill_db(user_id: int):
       conn.commit()
 
 
-# === ЛОГИКА ПРОМОКОДОВ (ПЕРВЫЙ ЗАКАЗ, ОДИН РАЗ, РУЧНОЕ ОДОБРЕНИЕ) ===
+# === ЛОГИКА ПРОМОКОДОВ (ПЕРВЫЙ ЗАКАЗ, ОДИН РАЗ, РУЧНОЕ ОДОБРЕНИЕ, СОХРАНЕНИЕ ДО ОПЛАТЫ) ===
 async def _user_has_any_order_db(user_id: int) -> bool:
   if PG_POOL:
     async with PG_POOL.acquire() as conn:
@@ -961,6 +1014,103 @@ async def _user_has_any_order_db(user_id: int) -> bool:
   with sqlite3.connect("bot_database.db") as conn:
     row = conn.execute("SELECT COUNT(*) FROM orders WHERE user_id = ?", (int(user_id),)).fetchone()
     return int(row[0] if row else 0) > 0
+
+
+async def _save_granted_promo_db(user_id: int, promo_code: str, discount_pct: int):
+  uid = int(user_id)
+  now_str = datetime.datetime.now().strftime("%d.%m.%Y %H:%M")
+  GRANTED_PROMO_DISCOUNTS[uid] = {
+      "user_id": uid,
+      "promo_code": promo_code,
+      "discount_pct": int(discount_pct),
+      "granted_at": now_str,
+  }
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute(
+          """
+            INSERT INTO promo_granted (user_id, promo_code, discount_pct, granted_at)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (user_id) DO UPDATE SET
+                promo_code = EXCLUDED.promo_code,
+                discount_pct = EXCLUDED.discount_pct,
+                granted_at = EXCLUDED.granted_at
+        """,
+          uid,
+          promo_code,
+          int(discount_pct),
+          now_str,
+      )
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute(
+          """
+            INSERT OR REPLACE INTO promo_granted (user_id, promo_code, discount_pct, granted_at)
+            VALUES (?, ?, ?, ?)
+        """,
+          (uid, promo_code, int(discount_pct), now_str),
+      )
+      conn.commit()
+
+
+async def _delete_granted_promo_db(user_id: int):
+  uid = int(user_id)
+  GRANTED_PROMO_DISCOUNTS.pop(uid, None)
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      await conn.execute("DELETE FROM promo_granted WHERE user_id = $1", uid)
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      conn.execute("DELETE FROM promo_granted WHERE user_id = ?", (uid,))
+      conn.commit()
+
+
+async def _get_active_granted_promo(user_id: int) -> dict | None:
+  uid = int(user_id)
+  if await _user_has_any_order_db(uid):
+    if uid in GRANTED_PROMO_DISCOUNTS:
+      await _delete_granted_promo_db(uid)
+    return None
+  if await _get_promo_redemption_db(uid):
+    if uid in GRANTED_PROMO_DISCOUNTS:
+      await _delete_granted_promo_db(uid)
+    return None
+
+  cached = GRANTED_PROMO_DISCOUNTS.get(uid)
+  if cached:
+    return cached
+
+  if PG_POOL:
+    async with PG_POOL.acquire() as conn:
+      row = await conn.fetchrow(
+          "SELECT user_id, promo_code, discount_pct, granted_at FROM promo_granted WHERE user_id = $1",
+          uid,
+      )
+      if row:
+        info = {
+            "user_id": int(row["user_id"]),
+            "promo_code": row["promo_code"],
+            "discount_pct": int(row["discount_pct"]),
+            "granted_at": row["granted_at"],
+        }
+        GRANTED_PROMO_DISCOUNTS[uid] = info
+        return info
+  else:
+    with sqlite3.connect("bot_database.db") as conn:
+      row = conn.execute(
+          "SELECT user_id, promo_code, discount_pct, granted_at FROM promo_granted WHERE user_id = ?",
+          (uid,),
+      ).fetchone()
+      if row:
+        info = {
+            "user_id": int(row[0]),
+            "promo_code": row[1],
+            "discount_pct": int(row[2]),
+            "granted_at": row[3],
+        }
+        GRANTED_PROMO_DISCOUNTS[uid] = info
+        return info
+  return None
 
 
 async def _get_promo_redemption_db(user_id: int) -> dict | None:
@@ -1018,6 +1168,21 @@ async def _record_promo_redemption_db(user_id: int, promo_code: str, discount_pc
           (int(user_id), promo_code, int(discount_pct), now_str),
       )
       conn.commit()
+
+
+async def _consume_promo_discount_after_payment(user_id: int):
+  """Списывает одноразовую скидку на первый заказ после оплаты услуги."""
+  uid = int(user_id)
+  granted = GRANTED_PROMO_DISCOUNTS.get(uid)
+  if granted:
+    await _record_promo_redemption_db(uid, granted["promo_code"], int(granted["discount_pct"]))
+  await _delete_granted_promo_db(uid)
+
+  journey = CLIENT_JOURNEY.get(uid)
+  if journey is not None:
+    journey.pop("promo_code", None)
+    journey.pop("discount_pct", None)
+    journey.pop("base_price", None)
 
 
 async def _save_promo_request_db(req: dict):
@@ -1507,6 +1672,8 @@ async def track_client_step(
   if step_key == "payment_menu" and prev.get("step") != "payment_menu":
     payment_cycle_seq += 1
 
+  granted = await _get_active_granted_promo(uid)
+
   CLIENT_JOURNEY[uid] = {
       "user_id": uid,
       "username": user.username or prev.get("username") or USER_MAPPING.get(uid),
@@ -1528,6 +1695,8 @@ async def track_client_step(
       "problem_query": problem_query if problem_query is not None else prev.get("problem_query"),
       "has_unpaid_active": unpaid_flag,
       "payment_cycle_seq": payment_cycle_seq,
+      "promo_code": granted["promo_code"] if granted else None,
+      "discount_pct": int(granted["discount_pct"]) if granted else 0,
       "updated_at": datetime.datetime.now().strftime("%d.%m %H:%M"),
   }
 
@@ -1778,11 +1947,24 @@ async def _issue_bill_to_client(
       if forbidden_msg:
         return False, f"❌ Отправка запрещена: {forbidden_msg}."
 
+  granted = await _get_active_granted_promo(target_user_id)
+  base_amount = float(amount)
+  if granted:
+    discount_pct = int(granted["discount_pct"])
+    promo_code = granted["promo_code"]
+    final_amount = _calculate_discounted_price(base_amount, discount_pct)
+  else:
+    discount_pct = 0
+    promo_code = None
+    final_amount = base_amount
+
   prev_target = (CLIENT_JOURNEY.get(target_user_id) or {}).get("target") or "По счету менеджера"
   bill_obj = {
       "service_name": service_name,
-      "total_price": amount,
-      "base_price": amount,
+      "total_price": final_amount,
+      "base_price": base_amount,
+      "promo_code": promo_code,
+      "discount_pct": discount_pct,
       "target_username": prev_target,
   }
   PENDING_BILLS[target_user_id] = bill_obj
@@ -1796,8 +1978,10 @@ async def _issue_bill_to_client(
     journey["step"] = "payment_menu"
     journey["step_label"] = STEP_LABELS["payment_menu"]
     journey["service_name"] = service_name
-    journey["price"] = amount
-    journey["base_price"] = amount
+    journey["price"] = final_amount
+    journey["base_price"] = base_amount
+    journey["promo_code"] = promo_code
+    journey["discount_pct"] = discount_pct
     journey["has_unpaid_active"] = True
     journey["service_selected"] = True
     journey["order_status"] = "⏳ Ожидает оплаты счёта"
@@ -1806,14 +1990,21 @@ async def _issue_bill_to_client(
 
   _schedule_unpaid_followup(bot, target_user_id, delay_seconds=900.0, cycle_seq=cycle_seq)
 
-  price_str = _format_price(amount)
+  if promo_code and discount_pct > 0 and base_amount > final_amount:
+    price_line = (
+        f"• К оплате: <s>{_format_price(base_amount)}$</s> → <b>{_format_price(final_amount)}$</b> "
+        f"<i>(промокод <b>{promo_code}</b> -{discount_pct}%)</i>"
+    )
+  else:
+    price_line = f"• К оплате: <b>{_format_price(final_amount)}$</b>"
+
   parts_text = []
   if accompanying_text:
     parts_text.append(f"💬 <b>Сообщение от менеджера:</b>\n{accompanying_text}\n")
   parts_text.append(
       f"🧾 <b>Вам выставлен счет на {service_name}</b>\n\n"
       f"• Услуга: <b>{service_name}</b>\n"
-      f"• К оплате: <b>{price_str}$</b>\n\n"
+      f"{price_line}\n\n"
       f"Выберите способ оплаты ниже или примените промокод (на первый заказ):"
   )
   bill_text = "\n".join(parts_text)
@@ -1829,7 +2020,7 @@ async def _issue_bill_to_client(
       text=bill_text,
       reply_markup=combined_kb,
   )
-  return True, f"✅ Счет на <b>{service_name}</b> (<b>{price_str}$</b>) отправлен пользователю <code>{target_user_id}</code>."
+  return True, f"✅ Счет на <b>{service_name}</b> (<b>{_format_price(final_amount)}$</b>) отправлен пользователю <code>{target_user_id}</code>."
 
 
 def _parse_bill_input_text(raw_text: str) -> tuple[str, float] | None:
@@ -1872,6 +2063,7 @@ def _build_catalog_keyboard() -> InlineKeyboardMarkup:
 async def _get_payment_context(user_id: int, state: FSMContext) -> dict:
   data = await state.get_data()
   bill = PENDING_BILLS.get(user_id, {})
+  granted = await _get_active_granted_promo(user_id)
 
   raw_price = data.get("total_price")
   if raw_price is None:
@@ -1881,8 +2073,12 @@ async def _get_payment_context(user_id: int, state: FSMContext) -> dict:
   if base_price is None:
     base_price = bill.get("base_price", raw_price)
 
-  promo_code = data.get("promo_code") or bill.get("promo_code")
-  discount_pct = int(data.get("discount_pct") or bill.get("discount_pct") or 0)
+  if granted:
+    promo_code = granted["promo_code"]
+    discount_pct = int(granted["discount_pct"])
+  else:
+    promo_code = None
+    discount_pct = 0
 
   if promo_code and discount_pct > 0:
     final_price = _calculate_discounted_price(base_price, discount_pct)
@@ -2230,8 +2426,19 @@ async def render_step(
 
 # === ГЛАВНОЕ МЕНЮ ===
 async def show_main_menu(event: Message | CallbackQuery, state: FSMContext):
-  await state.clear()
   user_id = event.from_user.id
+  granted = await _get_active_granted_promo(user_id)
+  await state.clear()
+  if granted:
+    await state.update_data(
+        promo_code=granted["promo_code"],
+        discount_pct=int(granted["discount_pct"]),
+    )
+    journey = CLIENT_JOURNEY.get(user_id)
+    if journey is not None:
+      journey["promo_code"] = granted["promo_code"]
+      journey["discount_pct"] = int(granted["discount_pct"])
+
   if user_id not in KNOWN_USERS:
     KNOWN_USERS[user_id] = datetime.datetime.now()
 
@@ -2337,7 +2544,6 @@ async def _render_special_confirm_step(event: Message | CallbackQuery, state: FS
 async def _render_summary_step(event: Message | CallbackQuery, state: FSMContext):
   updated_data = await state.get_data()
   ctx = await _get_payment_context(event.from_user.id, state)
-  price = ctx["total_price"]
   summary_text = (
       "✨ <b>Сводка заказа:</b>\n\n"
       f"• Услуга: <b>{updated_data.get('service_name')}</b>\n"
@@ -2357,21 +2563,55 @@ async def _render_summary_step(event: Message | CallbackQuery, state: FSMContext
 @router.callback_query(F.data == "enter_promocode")
 async def cb_enter_promocode(callback: CallbackQuery, state: FSMContext):
   await track_user(callback.from_user)
-  ctx = await _get_payment_context(callback.from_user.id, state)
+  user_id = callback.from_user.id
+  back_kb = InlineKeyboardMarkup(
+      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Вернуться к заказу", callback_data="back_to_payment_step", style="danger")]]
+  )
+
+  if await _user_has_any_order_db(user_id):
+    await render_step(
+        callback,
+        state,
+        "payment.jpg",
+        "⚠️ Промокод действует <b>только на первый заказ</b>.",
+        back_kb,
+    )
+    return
+
+  if await _get_promo_redemption_db(user_id):
+    await render_step(
+        callback,
+        state,
+        "payment.jpg",
+        "⚠️ Вы уже использовали промокод. Промокод применяется <b>строго один раз</b> для каждого клиента.",
+        back_kb,
+    )
+    return
+
+  granted = await _get_active_granted_promo(user_id)
+  if granted:
+    await render_step(
+        callback,
+        state,
+        "payment.jpg",
+        f"✅ У вас уже активирована одноразовая скидка <b>-{granted['discount_pct']}%</b> "
+        f"по промокоду <b>{granted['promo_code']}</b> на первый заказ.",
+        back_kb,
+    )
+    return
+
+  ctx = await _get_payment_context(user_id, state)
   if not ctx.get("base_price"):
     await state.update_data(base_price=ctx["total_price"], total_price=ctx["total_price"])
 
   await state.set_state(OrderForm.promocode)
-  keyboard = InlineKeyboardMarkup(
-      inline_keyboard=[[InlineKeyboardButton(text="⬅️ Вернуться к заказу", callback_data="back_to_payment_step", style="danger")]]
-  )
   text = (
       "🎟 <b>Активация промокода</b>\n\n"
       "Впиши промокод <b>одним словом</b> следующим сообщением.\n\n"
       "<i>Не знаешь как получить — пиши менеджеру (актуальный юзернейм менеджера вы всегда можете найти в нашем телеграм канале) "
       "и получи секретный промокод на скидку от -10% до -50% на первый заказ!</i>"
   )
-  await render_step(callback, state, "promocode.jpg", text, keyboard)
+  await render_step(callback, state, "promocode.jpg", text, back_kb)
 
 
 @router.message(OrderForm.promocode, F.text)
@@ -2424,6 +2664,18 @@ async def process_promocode_input(message: Message, state: FSMContext):
         state,
         "payment.jpg",
         "⚠️ Вы уже использовали промокод. Промокод применяется <b>строго один раз</b> для каждого клиента.",
+        back_kb,
+    )
+    return
+
+  existing_granted = await _get_active_granted_promo(user.id)
+  if existing_granted:
+    await render_step(
+        message,
+        state,
+        "payment.jpg",
+        f"✅ У вас уже активирована одноразовая скидка <b>-{existing_granted['discount_pct']}%</b> "
+        f"по промокоду <b>{existing_granted['promo_code']}</b> на первый заказ.",
         back_kb,
     )
     return
@@ -2551,17 +2803,19 @@ async def cb_promo_approve(callback: CallbackQuery):
   req["status"] = "approved"
   await _save_promo_request_db(req)
   PENDING_PROMO_REQUESTS.pop(req_id, None)
-  await _record_promo_redemption_db(client_id, req["promo_code"], int(req["discount_pct"]))
+
+  discount_pct = int(req["discount_pct"])
+  promo_code = req["promo_code"]
+  await _save_granted_promo_db(client_id, promo_code, discount_pct)
 
   base_amount = float(req["base_amount"])
-  discount_pct = int(req["discount_pct"])
   discounted_price = _calculate_discounted_price(base_amount, discount_pct)
 
   # Обновляем PENDING_BILLS (если выставлен счёт)
   if client_id in PENDING_BILLS:
     PENDING_BILLS[client_id]["base_price"] = base_amount
     PENDING_BILLS[client_id]["total_price"] = discounted_price
-    PENDING_BILLS[client_id]["promo_code"] = req["promo_code"]
+    PENDING_BILLS[client_id]["promo_code"] = promo_code
     PENDING_BILLS[client_id]["discount_pct"] = discount_pct
     await save_pending_bill_db(client_id, PENDING_BILLS[client_id])
 
@@ -2576,7 +2830,7 @@ async def cb_promo_approve(callback: CallbackQuery):
       await client_ctx.update_data(
           base_price=cur_base,
           total_price=cur_disc,
-          promo_code=req["promo_code"],
+          promo_code=promo_code,
           discount_pct=discount_pct,
       )
       if cur_base != base_amount:
@@ -2589,7 +2843,7 @@ async def cb_promo_approve(callback: CallbackQuery):
   if journey is not None:
     journey["base_price"] = base_amount
     journey["price"] = discounted_price
-    journey["promo_code"] = req["promo_code"]
+    journey["promo_code"] = promo_code
     journey["discount_pct"] = discount_pct
 
   if not await is_user_banned(client_id, USER_MAPPING.get(client_id)):
@@ -2597,8 +2851,8 @@ async def cb_promo_approve(callback: CallbackQuery):
       await callback.bot.send_message(
           chat_id=client_id,
           text=(
-              f"🎉 <b>Поздравляем! Вы получили скидку -{discount_pct}% на всю сумму заказа!</b>\n\n"
-              f"• Промокод: <b>{req['promo_code']}</b>\n"
+              f"🎉 <b>Поздравляем! Вы получили скидку -{discount_pct}% на один первый заказ!</b>\n\n"
+              f"• Промокод: <b>{promo_code}</b>\n"
               f"• Сумма: <s>{_format_price(base_amount)}$</s> → <b>{_format_price(discounted_price)}$</b> (-{discount_pct}%)"
           ),
           reply_markup=InlineKeyboardMarkup(
@@ -2609,13 +2863,13 @@ async def cb_promo_approve(callback: CallbackQuery):
     except Exception as e:
       logger.warning(f"Не удалось уведомить клиента {client_id} об одобрении промокода: {e}")
 
-  await callback.answer("Промокод подтверждён и применён один раз.")
+  await callback.answer("Промокод подтверждён и сохранён на один первый заказ.")
   try:
     await callback.message.edit_reply_markup(reply_markup=None)
   except Exception:
     pass
   await callback.message.reply(
-      f"✅ Промокод <b>{req['promo_code']}</b> (-{discount_pct}%) подтверждён для клиента <code>{client_id}</code>. "
+      f"✅ Промокод <b>{promo_code}</b> (-{discount_pct}%) подтверждён для клиента <code>{client_id}</code>. "
       f"Новая сумма: <b>{_format_price(discounted_price)}$</b>.",
       parse_mode="HTML",
   )
@@ -4222,7 +4476,16 @@ async def back_to_payment_step(callback: CallbackQuery, state: FSMContext):
 @router.callback_query(OrderForm.service, F.data == "srv_special_order")
 async def process_special_order_service(callback: CallbackQuery, state: FSMContext):
   service_name = "Особый заказ — Рассчитать стоимость"
-  await state.update_data(service_name=service_name, total_price=0, base_price=0, promo_code=None, discount_pct=0)
+  granted = await _get_active_granted_promo(callback.from_user.id)
+  promo_code = granted["promo_code"] if granted else None
+  discount_pct = int(granted["discount_pct"]) if granted else 0
+  await state.update_data(
+      service_name=service_name,
+      total_price=0,
+      base_price=0,
+      promo_code=promo_code,
+      discount_pct=discount_pct,
+  )
   await track_client_step(
       callback.bot,
       callback.from_user,
@@ -4238,22 +4501,32 @@ async def process_special_order_service(callback: CallbackQuery, state: FSMConte
 @router.callback_query(OrderForm.service, F.data.startswith("srv_"))
 async def process_service(callback: CallbackQuery, state: FSMContext):
   parts = callback.data.split("_")
-  price = int(parts[-1])
+  base_price = int(parts[-1])
   service_name = " ".join(parts[1:-1]).replace("_", " ")
+
+  granted = await _get_active_granted_promo(callback.from_user.id)
+  if granted:
+    promo_code = granted["promo_code"]
+    discount_pct = int(granted["discount_pct"])
+    final_price = _calculate_discounted_price(base_price, discount_pct)
+  else:
+    promo_code = None
+    discount_pct = 0
+    final_price = float(base_price)
 
   await state.update_data(
       service_name=service_name,
-      total_price=price,
-      base_price=price,
-      promo_code=None,
-      discount_pct=0,
+      total_price=final_price,
+      base_price=float(base_price),
+      promo_code=promo_code,
+      discount_pct=discount_pct,
   )
   await track_client_step(
       callback.bot,
       callback.from_user,
       "service_selected",
       service_name=service_name,
-      price=price,
+      price=final_price,
       has_unpaid_active=True,
   )
   await _render_target_step(callback, state)
@@ -4365,7 +4638,10 @@ async def process_submit_special_order(callback: CallbackQuery, state: FSMContex
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[[InlineKeyboardButton(text="🏠 На главную", callback_data="back_home", style="primary")]]
   )
+  granted = await _get_active_granted_promo(user.id)
   await state.clear()
+  if granted:
+    await state.update_data(promo_code=granted["promo_code"], discount_pct=int(granted["discount_pct"]))
   await render_step(callback, state, "main.jpg", text, keyboard)
 
 
@@ -4554,6 +4830,7 @@ async def process_cryptobot_check(callback: CallbackQuery, state: FSMContext):
   target_info = f"Цель: {target_username}"
 
   await add_order_to_db(user.id, service_name, total_price, "✅ Оплачено через CryptoBot", target_info)
+  await _consume_promo_discount_after_payment(user.id)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
   await _activate_send_thread(callback.bot, user.id, kind="order")
@@ -4703,6 +4980,7 @@ async def process_receipt_photo(message: Message, state: FSMContext):
   target_info = f"Цель: {target_username}"
 
   await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
+  await _consume_promo_discount_after_payment(user.id)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
   await _activate_send_thread(message.bot, user.id, kind="order")
@@ -4759,6 +5037,7 @@ async def process_receipt_document(message: Message, state: FSMContext):
   target_info = f"Цель: {target_username}"
 
   await add_order_to_db(user.id, service_name, total_price, "⏳ Ожидает проверки чека", target_info)
+  await _consume_promo_discount_after_payment(user.id)
   PENDING_BILLS.pop(user.id, None)
   await delete_pending_bill_db(user.id)
   await _activate_send_thread(message.bot, user.id, kind="order")
