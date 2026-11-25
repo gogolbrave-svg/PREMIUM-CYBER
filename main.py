@@ -2371,7 +2371,7 @@ async def cb_enter_promocode(callback: CallbackQuery, state: FSMContext):
       "<i>Не знаешь как получить — пиши менеджеру (актуальный юзернейм менеджера вы всегда можете найти в нашем телеграм канале) "
       "и получи секретный промокод на скидку от -10% до -50% на первый заказ!</i>"
   )
-  await render_step(callback, state, "payment.jpg", text, keyboard)
+  await render_step(callback, state, "promocode.jpg", text, keyboard)
 
 
 @router.message(OrderForm.promocode, F.text)
