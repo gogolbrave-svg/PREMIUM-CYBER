@@ -2117,8 +2117,8 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
   return InlineKeyboardMarkup(
       inline_keyboard=[
           [
-              InlineKeyboardButton(text="💳 Рубли", callback_data="pay_currency_RUB", style="primary"),
-              InlineKeyboardButton(text="💳 BYN", callback_data="pay_currency_BYN", style="danger"),
+              InlineKeyboardButton(text="💳 Рубли (RUB)", callback_data="pay_currency_RUB", style="primary"),
+              InlineKeyboardButton(text="💳 Бел. руб (BYN)", callback_data="pay_currency_BYN", style="danger"),
           ],
           [
               InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
