@@ -2124,10 +2124,6 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
               InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
               InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
           ],
-          [
-              InlineKeyboardButton(text="💳 Суммы (UZS)", callback_data="pay_currency_UZS", style="primary"),
-              InlineKeyboardButton(text="💳 Леи (MDL)", callback_data="pay_currency_MDL", style="danger"),
-          ],
           [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
           [InlineKeyboardButton(text="🪙 Реквизиты (Крипта)", callback_data="crypto_expert", style="danger")],
           [InlineKeyboardButton(text="🎟 Промокод", callback_data="enter_promocode", style="primary")],
@@ -2163,14 +2159,12 @@ async def track_user(user):
     await save_user_to_db(user)
 
 
-# === ВАЛЮТЫ ДЛЯ ОПЛАТЫ КАРТОЙ / СБП / НА НОМЕР ===
+# === ВАЛЮТЫ ДЛЯ ОПЛАТЫ КАРТОЙ / БАНКОВСКИМ ПЕРЕВОДОМ ===
 CURRENCY_CONFIG = {
     "RUB": {"country": "Россия", "name": "Рубли (RUB)", "symbol": "₽"},
     "BYN": {"country": "Беларусь", "name": "BYN", "symbol": "BYN"},
     "UAH": {"country": "Украина", "name": "Гривны (UAH)", "symbol": "грн."},
     "KZT": {"country": "Казахстан", "name": "Тенге (KZT)", "symbol": "₸"},
-    "UZS": {"country": "Узбекистан", "name": "Суммах (UZS)", "symbol": "сум"},
-    "MDL": {"country": "Молдова", "name": "Мд. леях (MDL)", "symbol": "лей"},
 }
 
 # === КРИПТОСЕТИ ===
@@ -2275,8 +2269,6 @@ async def get_exchange_rate(target_currency: str) -> float:
       "BYN": 3.3,
       "KZT": 480.0,
       "UAH": 41.5,
-      "UZS": 12500.0,
-      "MDL": 18.0,
   }
   return fallback_rates.get(target_currency, 1.0)
 
@@ -4723,12 +4715,10 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
     await render_step(callback, state, "payment.jpg", text, keyboard)
     return
 
-  sbp_line = "<b>Метод:</b> Карта / СБП / Перевод по номеру\n" if curr_code == "RUB" else "<b>Метод:</b> Карта / Перевод по номеру\n"
   text = (
       f"💳 <b>Оплата ({config['name']})</b>\n\n"
       f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_amount_with_promo(ctx)})</i>\n\n"
-      f"⚠️ <b>Переводите строго на реквизиты ниже:</b>\n\n"
-      f"{sbp_line}"
+      f"💡 Просто совершите банковский перевод на эти реквизиты:\n\n"
       f"<b>Банк:</b> {card['bank']}\n"
       f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
       "💡 <i>После перевода нажмите кнопку ниже для отправки чека или квитанции.</i>"
