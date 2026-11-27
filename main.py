@@ -2118,11 +2118,10 @@ def _build_payment_keyboard() -> InlineKeyboardMarkup:
       inline_keyboard=[
           [
               InlineKeyboardButton(text="💳 Рубли (RUB)", callback_data="pay_currency_RUB", style="primary"),
-              InlineKeyboardButton(text="💳 Бел. руб (BYN)", callback_data="pay_currency_BYN", style="danger"),
+              InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="danger"),
           ],
           [
-              InlineKeyboardButton(text="💳 Гривны (UAH)", callback_data="pay_currency_UAH", style="primary"),
-              InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="danger"),
+              InlineKeyboardButton(text="💳 Тенге (KZT)", callback_data="pay_currency_KZT", style="primary"),
           ],
           [InlineKeyboardButton(text="🤖 Оплата через CryptoBot", callback_data="pay_cryptobot", style="primary")],
           [InlineKeyboardButton(text="🪙 Реквизиты (Крипта)", callback_data="crypto_expert", style="danger")],
@@ -4715,14 +4714,24 @@ async def process_pay_currency(callback: CallbackQuery, state: FSMContext):
     await render_step(callback, state, "payment.jpg", text, keyboard)
     return
 
-  text = (
-      f"💳 <b>Оплата ({config['name']})</b>\n\n"
-      f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_amount_with_promo(ctx)})</i>\n\n"
-      f"💡 Просто совершите банковский перевод на эти реквизиты:\n\n"
-      f"<b>Банк:</b> {card['bank']}\n"
-      f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
-      "💡 <i>После перевода нажмите кнопку ниже для отправки чека или квитанции.</i>"
-  )
+  if curr_code == "RUB":
+    text = (
+        f"💳 <b>Оплата ({config['name']})</b>\n\n"
+        f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_amount_with_promo(ctx)})</i>\n\n"
+        f"💡 Сделайте банковский перевод на реквизиты ниже. Обратите внимание: перевод необходимо совершить именно в <b>российских рублях (RUB)</b> — этот вариант также действует для оплаты из Беларуси.\n\n"
+        f"<b>Банк:</b> {card['bank']}\n"
+        f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
+        "💡 <i>После перевода нажмите кнопку ниже для отправки чека или квитанции.</i>"
+    )
+  else:
+    text = (
+        f"💳 <b>Оплата ({config['name']})</b>\n\n"
+        f"• Итого к оплате: <b>{local_amount:,} {config['symbol']}</b> <i>({_format_amount_with_promo(ctx)})</i>\n\n"
+        f"💡 Просто совершите банковский перевод на эти реквизиты:\n\n"
+        f"<b>Банк:</b> {card['bank']}\n"
+        f"<b>Реквизиты:</b> <code>{card['details']}</code>\n\n"
+        "💡 <i>После перевода нажмите кнопку ниже для отправки чека или квитанции.</i>"
+    )
   keyboard = InlineKeyboardMarkup(
       inline_keyboard=[
           [InlineKeyboardButton(text="✅ Прикрепить чек", callback_data="ask_for_receipt", style="primary")],
